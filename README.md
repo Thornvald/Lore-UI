@@ -1,6 +1,9 @@
 # Lore UI
 ![Lore UI](Lore_UI.png)
 
+> [!WARNING]
+> **Work in Progress**: This project is currently under active development and is not yet finished. Features may change or be incomplete.
+
 A desktop GUI for the [Lore](https://epicgames.github.io/lore/) version control system - a clean, GitHub-Desktop-style client built with Tauri and TypeScript.
 
 ### Why Lore UI?
