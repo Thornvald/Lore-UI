@@ -1,8 +1,10 @@
 # Lore UI
+![Lore UI](Lore_UI.png)
 
 A desktop GUI for the [Lore](https://epicgames.github.io/lore/) version control system - a clean, GitHub-Desktop-style client built with Tauri and TypeScript.
 
-Lore ships as a CLI only. This app wraps it in a compact, grayscale interface so common work (and the full command set) is a click away.
+### Why Lore UI?
+Lore ships as a CLI only. Lore UI was designed to allow designers to easily use Lore alongside developers, wrapping the powerful command set of the Lore CLI from Epic into a compact, grayscale interface so common work is just a click away.
 
 ## Features
 
