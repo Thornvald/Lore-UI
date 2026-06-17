@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Lore</title>
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+
+  <body>
+    <!-- ===================== EMPTY STATE ===================== -->
+    <div id="empty" class="empty-state">
+      <h1>LORE</h1>
+      <p class="muted">Open a Lore project, or start a new one.</p>
+      <div class="welcome-actions">
+        <button id="open-btn-2" class="primary">Open project</button>
+        <button id="create-btn-2">New project</button>
+      </div>
+    </div>
+
+    <!-- ===================== APP ===================== -->
+    <div id="app" class="app hidden">
+      <header class="gh-topbar">
+        <button id="proj-btn" class="gh-dd">
+          <span class="gh-dd-col">
+            <span class="gh-dd-label">Current project</span>
+            <span id="proj-name" class="gh-dd-value">—</span>
+          </span>
+          <span class="caret">▾</span>
+        </button>
+        <button id="branch-btn" class="gh-dd">
+          <span class="gh-dd-col">
+            <span class="gh-dd-label">Current branch</span>
+            <span id="branch-name" class="gh-dd-value">—</span>
+          </span>
+          <span class="caret">▾</span>
+        </button>
+        <button id="sync-btn" class="gh-dd gh-sync">
+          <span class="gh-dd-col">
+            <span id="sync-title" class="gh-dd-value">Sync</span>
+            <span id="sync-sub" class="gh-dd-label">—</span>
+          </span>
+        </button>
+        <div class="gh-spacer"></div>
+        <button id="server-btn" class="bare-btn server-btn">
+          <span id="server-dot" class="dot down"></span>
+          <span id="server-label">Server</span>
+        </button>
+        <button id="settings-btn" class="bare-btn">Settings</button>
+        <button id="console-toggle" class="bare-btn">Console</button>
+      </header>
+
+      <div class="gh-body">
+        <aside class="gh-side">
+          <div class="gh-tabs">
+            <button id="tab-changes" class="gh-tab active">Changes</button>
+            <button id="tab-history" class="gh-tab">History</button>
+          </div>
+
+          <!-- Changes -->
+          <div id="pane-changes" class="gh-pane">
+            <div class="gh-list-head">
+              <label class="selectall">
+                <input type="checkbox" id="check-all" />
+                <span id="changes-count">No changes</span>
+              </label>
+              <div class="head-actions">
+                <button id="refresh-changes" class="link-btn">Refresh</button>
+                <button id="discard-all" class="link-btn">Discard all</button>
+              </div>
+            </div>
+            <ul id="file-list" class="gh-files"></ul>
+            <div class="commit-box">
+              <input id="commit-msg" placeholder="Summary (required)" />
+              <button id="save-btn" class="primary" disabled>
+                Commit to <span id="commit-branch">main</span>
+              </button>
+            </div>
+          </div>
+
+          <!-- History -->
+          <div id="pane-history" class="gh-pane hidden">
+            <ul id="history-list" class="gh-commits"></ul>
+          </div>
+        </aside>
+
+        <main class="gh-main">
+          <div id="detail-empty" class="detail-empty muted">
+            Select a file or a commit to see its changes.
+          </div>
+          <div id="detail" class="detail hidden">
+            <div class="detail-head">
+              <div class="detail-head-text">
+                <span id="detail-title"></span>
+                <span id="detail-sub" class="muted small"></span>
+              </div>
+              <div id="detail-actions" class="detail-actions"></div>
+            </div>
+            <div id="detail-files" class="detail-files hidden"></div>
+            <pre id="detail-diff" class="detail-diff"></pre>
+          </div>
+        </main>
+      </div>
+
+      <!-- Console (covers the body when toggled) -->
+      <div id="view-console" class="gh-console hidden">
+        <div class="cmd-bar">
+          <span class="cmd-prefix">lore</span>
+          <input id="cmd-input" placeholder="e.g.  history   ·   branch list   ·   diff a.txt" />
+          <button id="cmd-run" class="primary">Run</button>
+        </div>
+        <div class="console-body">
+          <ul id="cmd-list" class="cmd-list"></ul>
+          <pre id="cmd-out" class="cmd-out muted">Pick a command on the left to see its help, or type one above and Run.
+This runs the real lore CLI - anything the CLI does, you can do here.</pre>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===================== POPOVERS ===================== -->
+    <div id="proj-menu" class="popover hidden">
+      <div class="popover-path" id="proj-path"></div>
+      <button id="open-btn" class="popover-item">Open another project…</button>
+      <button id="create-btn" class="popover-item">New project…</button>
+    </div>
+
+    <div id="server-menu" class="popover hidden">
+      <div class="popover-path" id="server-addr-display"></div>
+      <div id="server-type-line" class="popover-status">Type: …</div>
+      <div id="server-status-line" class="popover-status">Status: …</div>
+      <button id="server-start" class="popover-item hidden">Start local server</button>
+      <button id="server-stop" class="popover-item hidden">Stop local server</button>
+      <div id="server-remote-note" class="popover-note hidden">Remote server - managed outside this tool.</div>
+    </div>
+
+    <div id="branch-menu" class="popover hidden">
+      <ul id="branch-list-menu" class="popover-list"></ul>
+      <div class="popover-divider"></div>
+      <button id="newbranch-btn" class="popover-item">New branch…</button>
+      <button id="merge-open-btn" class="popover-item">Merge a branch into this…</button>
+    </div>
+
+    <!-- ===================== MODALS ===================== -->
+    <div id="ask-overlay" class="overlay hidden">
+      <div class="ask-box">
+        <h2 id="ask-title">Enter a value</h2>
+        <p id="ask-hint" class="muted small"></p>
+        <input id="ask-input" />
+        <div class="ask-actions">
+          <button id="ask-cancel" class="ghost">Cancel</button>
+          <button id="ask-ok" class="primary">OK</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="merge-overlay" class="overlay hidden">
+      <div class="ask-box">
+        <h2>Merge a branch into <span id="merge-target"></span></h2>
+        <p class="muted small">Bring another branch's work into the branch you are on now.</p>
+        <select id="merge-source"></select>
+        <input id="merge-msg" placeholder="Message for the merge" />
+        <div class="ask-actions">
+          <button id="merge-cancel" class="ghost">Cancel</button>
+          <button id="merge-ok" class="primary">Merge</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===================== SETTINGS ===================== -->
+    <div id="settings-overlay" class="overlay hidden">
+      <div class="settings-box">
+        <div class="settings-head">
+          <h2>Settings</h2>
+          <span class="muted small">Applied to every lore command</span>
+        </div>
+        <div class="settings-body">
+          <section class="set-group">
+            <h3>Server</h3>
+            <label class="set-field">Server address
+              <input id="set-serveraddr" placeholder="lore://127.0.0.1:41337" />
+            </label>
+            <p class="muted small">Local address (127.0.0.1 / localhost) auto-starts a server. A remote address is connect-only.</p>
+          </section>
+
+          <section class="set-group">
+            <h3>Data source</h3>
+            <label class="set-radio"><input type="radio" name="source" value="" checked /> Default (let lore decide)</label>
+            <label class="set-radio"><input type="radio" name="source" value="--remote" /> Remote - always use server data</label>
+            <label class="set-radio"><input type="radio" name="source" value="--local" /> Local - work offline from local store</label>
+          </section>
+
+          <section class="set-group">
+            <h3>Behavior</h3>
+            <label class="set-check"><input type="checkbox" id="set-offline" /> Offline mode (--offline)</label>
+            <label class="set-check"><input type="checkbox" id="set-force" /> Force operations when possible (--force)</label>
+            <label class="set-check"><input type="checkbox" id="set-dryrun" /> Dry run - report only, change nothing (--dry-run)</label>
+            <label class="set-check"><input type="checkbox" id="set-cache" /> Cache fetched fragments locally (--cache)</label>
+            <label class="set-check"><input type="checkbox" id="set-gc" /> Background garbage collection (--gc)</label>
+            <label class="set-check"><input type="checkbox" id="set-syncdata" /> Force sync data to disk (--sync-data)</label>
+            <label class="set-check"><input type="checkbox" id="set-searchnearest" /> Search for nearest revision match (--search-nearest)</label>
+          </section>
+
+          <section class="set-group">
+            <h3>Identity &amp; logging</h3>
+            <label class="set-field">Identity (--identity)
+              <input id="set-identity" placeholder="leave blank for default" />
+            </label>
+            <label class="set-field">Log level (--log-level)
+              <select id="set-loglevel">
+                <option value="">default</option>
+                <option value="error">error</option>
+                <option value="warn">warn</option>
+                <option value="info">info</option>
+                <option value="debug">debug</option>
+                <option value="trace">trace</option>
+              </select>
+            </label>
+          </section>
+
+          <section class="set-group">
+            <h3>Limits</h3>
+            <p class="muted small">Leave blank to use lore defaults.</p>
+            <label class="set-field">Max connections (--max-connections)<input id="set-maxconn" type="number" min="1" /></label>
+            <label class="set-field">Max open files (--file-count-limit)<input id="set-filecount" type="number" min="1" /></label>
+            <label class="set-field">Max open bytes (--file-size-limit)<input id="set-filesize" type="number" min="1" /></label>
+            <label class="set-field">Max parallel compress (--compress-limit)<input id="set-compress" type="number" min="1" /></label>
+            <label class="set-field">Max revisions searched (--search-limit)<input id="set-searchlimit" type="number" min="1" /></label>
+          </section>
+        </div>
+        <div class="settings-foot">
+          <span id="settings-preview" class="muted small"></span>
+          <div class="ask-actions">
+            <button id="settings-cancel" class="ghost">Cancel</button>
+            <button id="settings-save" class="primary">Save</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>
