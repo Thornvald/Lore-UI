@@ -16,6 +16,7 @@
       <div class="welcome-actions">
         <button id="open-btn-2" class="primary">Open project</button>
         <button id="create-btn-2">New project</button>
+        <button id="setup-btn-2" class="ghost">Set up a server</button>
       </div>
     </div>
 
@@ -52,14 +53,35 @@
       </header>
 
       <div class="gh-body">
-        <aside class="gh-side">
-          <div class="gh-tabs">
-            <button id="tab-changes" class="gh-tab active">Changes</button>
-            <button id="tab-history" class="gh-tab">History</button>
+        <!-- Left nav tree (Lore: Changes / History / Branches / Remotes) -->
+        <nav class="nav-side">
+          <div class="nav-group">
+            <div class="nav-head">Workspace</div>
+            <button id="nav-changes" class="nav-item active">
+              <span class="nav-ic">◆</span><span class="nav-label">Changes</span>
+              <span id="nav-changes-count" class="nav-count hidden"></span>
+            </button>
+            <button id="nav-history" class="nav-item">
+              <span class="nav-ic">⟲</span><span class="nav-label">History</span>
+            </button>
           </div>
+          <div class="nav-group">
+            <div class="nav-head">
+              Branches
+              <button id="nav-newbranch" class="nav-head-btn" title="New branch">+</button>
+            </div>
+            <ul id="nav-branches" class="nav-list"></ul>
+          </div>
+          <div class="nav-group">
+            <div class="nav-head">Remotes</div>
+            <ul id="nav-remotes" class="nav-list"></ul>
+          </div>
+        </nav>
 
+        <aside class="gh-side">
           <!-- Changes -->
           <div id="pane-changes" class="gh-pane">
+            <div id="conflict-banner" class="conflict-banner hidden"></div>
             <div class="gh-list-head">
               <label class="selectall">
                 <input type="checkbox" id="check-all" />
@@ -70,7 +92,14 @@
                 <button id="discard-all" class="link-btn">Discard all</button>
               </div>
             </div>
-            <ul id="file-list" class="gh-files"></ul>
+            <div class="list-tools">
+              <input id="filter-ext" class="filter-input" placeholder="Filter (e.g. png, .uasset)" />
+              <select id="sort-mode" class="sort-select" title="Sort files">
+                <option value="name">Name</option>
+                <option value="type">Type</option>
+              </select>
+            </div>
+            <div id="file-list" class="gh-files"></div>
             <div class="commit-box">
               <input id="commit-msg" placeholder="Summary (required)" />
               <button id="save-btn" class="primary" disabled>
@@ -81,9 +110,14 @@
 
           <!-- History -->
           <div id="pane-history" class="gh-pane hidden">
-            <ul id="history-list" class="gh-commits"></ul>
+            <div class="gh-list-head">
+              <span id="history-head" class="muted small">History</span>
+            </div>
+            <div id="history-list" class="gh-commits"></div>
           </div>
         </aside>
+
+        <div id="side-splitter" class="splitter" title="Drag to resize"></div>
 
         <main class="gh-main">
           <div id="detail-empty" class="detail-empty muted">
@@ -98,7 +132,12 @@
               <div id="detail-actions" class="detail-actions"></div>
             </div>
             <div id="detail-files" class="detail-files hidden"></div>
+            <div id="detail-preview" class="detail-preview hidden"></div>
+            <div id="diff-toolbar" class="diff-toolbar hidden">
+              <button id="diff-mode" class="link-btn">Side by side</button>
+            </div>
             <pre id="detail-diff" class="detail-diff"></pre>
+            <div id="preview-caption" class="preview-caption hidden"></div>
           </div>
         </main>
       </div>
@@ -121,6 +160,8 @@ This runs the real lore CLI - anything the CLI does, you can do here.</pre>
     <!-- ===================== POPOVERS ===================== -->
     <div id="proj-menu" class="popover hidden">
       <div class="popover-path" id="proj-path"></div>
+      <ul id="recent-list" class="popover-list hidden"></ul>
+      <div class="popover-divider"></div>
       <button id="open-btn" class="popover-item">Open another project…</button>
       <button id="create-btn" class="popover-item">New project…</button>
     </div>
@@ -132,6 +173,8 @@ This runs the real lore CLI - anything the CLI does, you can do here.</pre>
       <button id="server-start" class="popover-item hidden">Start local server</button>
       <button id="server-stop" class="popover-item hidden">Stop local server</button>
       <div id="server-remote-note" class="popover-note hidden">Remote server - managed outside this tool.</div>
+      <div class="popover-divider"></div>
+      <button id="server-setup" class="popover-item">Set up server…</button>
     </div>
 
     <div id="branch-menu" class="popover hidden">
@@ -140,6 +183,9 @@ This runs the real lore CLI - anything the CLI does, you can do here.</pre>
       <button id="newbranch-btn" class="popover-item">New branch…</button>
       <button id="merge-open-btn" class="popover-item">Merge a branch into this…</button>
     </div>
+
+    <!-- Right-click context menu (commits + branches), filled at runtime -->
+    <div id="ctx-menu" class="popover ctx-menu hidden"></div>
 
     <!-- ===================== MODALS ===================== -->
     <div id="ask-overlay" class="overlay hidden">
@@ -167,6 +213,22 @@ This runs the real lore CLI - anything the CLI does, you can do here.</pre>
       </div>
     </div>
 
+    <div id="resolve-overlay" class="overlay hidden">
+      <div class="ask-box resolve-box">
+        <h2>Resolve merge conflicts</h2>
+        <p class="muted small">Pick a side per file, or for all. Lore stays mid-merge until you finish or abort.</p>
+        <div id="resolve-list" class="resolve-list"></div>
+        <div class="resolve-bulk">
+          <button id="resolve-all-mine" class="ghost small">Use mine for all</button>
+          <button id="resolve-all-theirs" class="ghost small">Use theirs for all</button>
+        </div>
+        <div class="ask-actions">
+          <button id="merge-abort" class="ghost">Abort merge</button>
+          <button id="merge-finish" class="primary">Finish merge</button>
+        </div>
+      </div>
+    </div>
+
     <!-- ===================== SETTINGS ===================== -->
     <div id="settings-overlay" class="overlay hidden">
       <div class="settings-box">
@@ -175,6 +237,18 @@ This runs the real lore CLI - anything the CLI does, you can do here.</pre>
           <span class="muted small">Applied to every lore command</span>
         </div>
         <div class="settings-body">
+          <section class="set-group">
+            <h3>This project</h3>
+            <label class="set-field">Identity email (this repo)
+              <input id="set-repoidentity" placeholder="you@example.com" />
+            </label>
+            <p class="muted small">Saved to this project's <code>.lore/config.toml</code> and used to label your commits. Each project can have its own.</p>
+            <label class="set-field">GitHub username (this repo)
+              <input id="set-ghuser" placeholder="octocat" />
+            </label>
+            <p class="muted small">Used to show your GitHub profile picture as the avatar - more reliable than email lookup. Falls back to Gravatar / an identicon.</p>
+          </section>
+
           <section class="set-group">
             <h3>Server</h3>
             <label class="set-field">Server address
@@ -233,6 +307,66 @@ This runs the real lore CLI - anything the CLI does, you can do here.</pre>
           <div class="ask-actions">
             <button id="settings-cancel" class="ghost">Cancel</button>
             <button id="settings-save" class="primary">Save</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===================== SERVER SETUP ===================== -->
+    <div id="setup-overlay" class="overlay hidden">
+      <div class="settings-box setup-box">
+        <div class="settings-head">
+          <h2>Set up Lore</h2>
+          <span class="muted small">Point the app at a server, or host one here</span>
+        </div>
+        <div class="settings-body">
+          <div class="setup-choices">
+            <label class="setup-card">
+              <input type="radio" name="setupmode" value="host" />
+              <span class="setup-card-body">
+                <span class="setup-card-title">Host on this PC</span>
+                <span class="setup-card-desc muted small">Run a Lore server here. Good for solo work, or a quick share over LAN / VPN (Tailscale).</span>
+              </span>
+            </label>
+            <label class="setup-card">
+              <input type="radio" name="setupmode" value="connect" />
+              <span class="setup-card-body">
+                <span class="setup-card-title">Connect to a team server</span>
+                <span class="setup-card-desc muted small">Use a shared server - a VPS or a machine on your VPN. Enter its address.</span>
+              </span>
+            </label>
+          </div>
+
+          <section id="setup-host" class="set-group hidden">
+            <h3>This PC as server</h3>
+            <label class="set-field">Port<input id="setup-port" type="number" min="1" value="41337" /></label>
+            <p class="muted small">Teammates on your LAN or VPN reach you at this address:</p>
+            <div class="setup-share">
+              <code id="setup-share-url">lore://…</code>
+              <button id="setup-copy" class="ghost small">Copy</button>
+            </div>
+            <p id="setup-host-note" class="muted small"></p>
+            <div class="setup-server-row">
+              <span id="setup-server-state" class="muted small">Status: …</span>
+              <button id="setup-server-toggle" class="ghost small">Start server</button>
+            </div>
+          </section>
+
+          <section id="setup-connect" class="set-group hidden">
+            <h3>Team server address</h3>
+            <label class="set-field">Address<input id="setup-addr" placeholder="lore://100.x.y.z:41337" /></label>
+            <p class="muted small">A VPS hostname or a VPN IP, e.g. Tailscale <code>lore://100.x.y.z:41337</code>. The app will not start or stop this server.</p>
+            <div class="setup-server-row">
+              <button id="setup-test" class="ghost small">Test connection</button>
+              <span id="setup-test-state" class="muted small"></span>
+            </div>
+          </section>
+        </div>
+        <div class="settings-foot">
+          <span class="muted small">Saved as your server address</span>
+          <div class="ask-actions">
+            <button id="setup-cancel" class="ghost">Cancel</button>
+            <button id="setup-save" class="primary">Save</button>
           </div>
         </div>
       </div>

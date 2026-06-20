@@ -2,6 +2,7 @@ import "@fontsource-variable/geist";
 import "@fontsource-variable/geist-mono";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
+import { mountPreview, previewKind, extOf } from "./preview";
 
 // ---- Types mirror the Rust serde structs ----
 interface FileChange { status: "A" | "M" | "D"; path: string; }
@@ -13,17 +14,32 @@ interface StatusInfo {
   staged: FileChange[];
   unstaged: FileChange[];
   untracked: FileChange[];
+  conflicts: FileChange[];
   raw: string;
 }
 interface Branch { name: string; current: boolean; }
 interface BranchList { local: Branch[]; remote: Branch[]; raw: string; }
 interface RunResult { output: string; ok: boolean; }
+interface FileMeta { size: number; exists: boolean; }
 interface Commit {
   revision: string;
   signature: string;
+  branch: string;
   date: string;
   message: string;
   is_merge: boolean;
+}
+
+// One file row in the changes list, before it is folded into the folder tree.
+interface FileRow { change: FileChange; staged: boolean; }
+
+// A node in the folder tree we build from flat file paths.
+interface TreeNode {
+  name: string;
+  full: string;
+  dir: boolean;
+  children: Map<string, TreeNode>;
+  payload?: unknown;
 }
 
 const STATUS_LABEL: Record<string, string> = { A: "New", M: "Changed", D: "Removed" };
@@ -60,6 +76,26 @@ const LORE_COMMANDS: { cmd: string; desc: string }[] = [
 let repoPath = "";
 let history: Commit[] = [];
 let consoleOn = false;
+// Cleanup for the live preview (image object URL / three.js context), if any.
+let previewCleanup: (() => void) | null = null;
+// This machine's LAN IP, fetched once for the server setup share line.
+let setupLanIp: string | null | undefined = undefined;
+// Last status, kept so sort/filter can re-render the list without re-fetching.
+let lastStatus: StatusInfo | null = null;
+let fileSort: "name" | "type" = "name";
+let fileFilter = "";
+// The repo's configured identity (email or name), for author avatars. One per
+// repo - Lore records no per-commit author.
+let repoIdentity = "";
+// Cached avatar URL for the repo identity (GitHub or Gravatar), resolved once.
+let avatarUrl: string | null = null;
+// Optional GitHub username for this repo (UI-only, stored locally) - the most
+// reliable way to show a real profile picture.
+let repoGithubUser = "";
+const ghUserKey = (repo: string) => "ghUser:" + repo;
+// Diff display mode + the last diff text, so the toggle can re-render in place.
+let diffMode: "unified" | "split" = localStorage.getItem("diffMode") === "split" ? "split" : "unified";
+let lastDiffText = "";
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 
@@ -112,9 +148,51 @@ async function createProject() {
   }
 }
 
+// ---- Known (recent) projects ----
+const RECENT_KEY = "recentProjects";
+function recentProjects(): string[] {
+  try { return JSON.parse(localStorage.getItem(RECENT_KEY) || "[]"); } catch { return []; }
+}
+function addRecentProject(path: string) {
+  const list = recentProjects().filter((p) => p !== path);
+  list.unshift(path);
+  localStorage.setItem(RECENT_KEY, JSON.stringify(list.slice(0, 8)));
+}
+function renderRecent() {
+  const ul = $("recent-list") as HTMLUListElement;
+  ul.innerHTML = "";
+  const list = recentProjects();
+  ul.classList.toggle("hidden", list.length === 0);
+  for (const p of list) {
+    const li = document.createElement("li");
+    li.className = "recent-item" + (p === repoPath ? " current" : "");
+    li.title = p;
+    const nm = document.createElement("span"); nm.className = "recent-name"; nm.textContent = baseName(p);
+    const pa = document.createElement("span"); pa.className = "recent-path"; pa.textContent = p;
+    li.append(nm, pa);
+    li.addEventListener("click", () => { closeAllPopovers(); openKnownProject(p); });
+    ul.appendChild(li);
+  }
+}
+async function openKnownProject(path: string) {
+  if (path === repoPath) return;
+  const ok = await invoke<boolean>("lore_is_repo", { repo: path }).catch(() => false);
+  if (!ok) {
+    alert("That project is not available (folder missing or not a Lore project). Removing it from the list.");
+    localStorage.setItem(RECENT_KEY, JSON.stringify(recentProjects().filter((p) => p !== path)));
+    renderRecent();
+    return;
+  }
+  await enterProject(path);
+}
+
 async function enterProject(path: string) {
   repoPath = path;
   localStorage.setItem("repoPath", repoPath);
+  addRecentProject(path);
+  repoIdentity = await invoke<string>("lore_identity", { repo: path }).catch(() => "");
+  repoGithubUser = localStorage.getItem(ghUserKey(path)) || "";
+  avatarUrl = null; // re-resolve the avatar for this repo's identity
   $("proj-name").textContent = baseName(path);
   $("proj-path").textContent = path;
   $("empty").classList.add("hidden");
@@ -141,7 +219,210 @@ async function refreshAll() {
 
 async function refreshStatus() {
   const s = await call<StatusInfo>("lore_status", { repo: repoPath });
-  if (s) renderStatus(s);
+  if (s) { lastStatus = s; renderStatus(s); }
+}
+
+// ---- Folder tree (shared by Changes and commit file lists) ----
+// Fork-style: fold flat "a/b/file" paths into collapsible folders.
+function buildTree(items: { path: string; payload: unknown }[]): TreeNode {
+  const root: TreeNode = { name: "", full: "", dir: true, children: new Map() };
+  for (const it of items) {
+    const parts = it.path.split(/[\\/]/).filter(Boolean);
+    let node = root;
+    parts.forEach((part, i) => {
+      const leaf = i === parts.length - 1;
+      let child = node.children.get(part);
+      if (!child) {
+        child = { name: part, full: parts.slice(0, i + 1).join("/"), dir: !leaf, children: new Map() };
+        node.children.set(part, child);
+      }
+      if (leaf) { child.dir = false; child.payload = it.payload; }
+      node = child;
+    });
+  }
+  return root;
+}
+
+function sortKids(node: TreeNode): TreeNode[] {
+  // Folders first, then files - by name, or by extension when "type" is picked.
+  return [...node.children.values()].sort((a, b) => {
+    if (a.dir !== b.dir) return a.dir ? -1 : 1;
+    if (fileSort === "type" && !a.dir && !b.dir) {
+      const ea = extOf(a.name), eb = extOf(b.name);
+      if (ea !== eb) return ea.localeCompare(eb);
+    }
+    return a.name.localeCompare(b.name);
+  });
+}
+
+const indent = (depth: number) => depth * 14 + 8 + "px";
+
+function renderTree(
+  parent: HTMLElement,
+  node: TreeNode,
+  depth: number,
+  fileRow: (n: TreeNode, depth: number) => HTMLElement,
+) {
+  for (const k of sortKids(node)) {
+    if (!k.dir) { parent.appendChild(fileRow(k, depth)); continue; }
+    const row = document.createElement("div");
+    row.className = "tree-folder";
+    row.style.paddingLeft = indent(depth);
+    const caret = document.createElement("span"); caret.className = "tree-caret"; caret.textContent = "▾";
+    const name = document.createElement("span"); name.className = "tree-folder-name"; name.textContent = k.name;
+    row.append(caret, name);
+    const box = document.createElement("div"); box.className = "tree-children";
+    row.addEventListener("click", () => {
+      const collapsed = row.classList.toggle("collapsed");
+      box.classList.toggle("hidden", collapsed);
+      caret.textContent = collapsed ? "▸" : "▾";
+    });
+    parent.append(row, box);
+    renderTree(box, k, depth + 1, fileRow);
+  }
+}
+
+function statusTag(status: string): HTMLSpanElement {
+  const tag = document.createElement("span");
+  tag.className = "tag tag-" + status;
+  tag.title = STATUS_LABEL[status] ?? status;
+  tag.textContent = status;
+  return tag;
+}
+
+// A file row inside the Changes tree: checkbox, status tag, name, discard.
+function changesFileRow(node: TreeNode, depth: number): HTMLElement {
+  const r = node.payload as FileRow;
+  const row = document.createElement("div");
+  row.className = "tree-file";
+  row.dataset.path = r.change.path;
+  row.style.paddingLeft = indent(depth);
+
+  const cb = document.createElement("input");
+  cb.type = "checkbox";
+  cb.className = "file-check";
+  cb.dataset.path = r.change.path;
+  cb.checked = true; // select everything by default so commit is one click
+  cb.addEventListener("click", (e) => e.stopPropagation());
+  cb.addEventListener("change", onFileCheckChange);
+
+  const nm = document.createElement("span");
+  nm.className = "tree-file-name";
+  nm.textContent = node.name;
+  nm.title = r.change.path;
+
+  const discard = document.createElement("button");
+  discard.className = "row-x";
+  discard.title = "Discard changes to this file";
+  discard.textContent = "⨯";
+  discard.addEventListener("click", (e) => { e.stopPropagation(); discardFiles([r.change.path]); });
+
+  row.append(cb, statusTag(r.change.status), fileVisual(r.change.path), nm, discard);
+
+  row.addEventListener("click", () => showWorkingFile(r.change.path));
+  row.addEventListener("contextmenu", (e) => { e.preventDefault(); openContextMenu(e.clientX, e.clientY, fileMenu(r.change.path)); });
+  return row;
+}
+
+// Leading visual for a file row: a real thumbnail for pictures and Unreal
+// assets, a small kind glyph for everything else - so every file shows
+// something next to its name.
+function fileVisual(path: string): HTMLElement {
+  const kind = previewKind(path);
+  if (kind === "image") { const img = thumbImg(); attachThumb(img, path); return img; }
+  if (kind === "uasset") { const img = thumbImg(); attachUassetThumb(img, path); return img; }
+  const ic = document.createElement("span");
+  ic.className = "row-icon";
+  ic.textContent = kindGlyph(kind);
+  return ic;
+}
+function thumbImg(): HTMLImageElement {
+  const img = document.createElement("img");
+  img.className = "row-thumb";
+  return img;
+}
+function kindGlyph(kind: string): string {
+  switch (kind) {
+    case "model": return "◈";
+    case "audio": return "♪";
+    case "texture": return "▦";
+    case "blend": return "◆";
+    case "binary": return "▥";
+    default: return "≡";
+  }
+}
+// Load a small inline thumbnail for an image row (skips big/missing files so a
+// 4K texture does not get read just to draw a 20px square).
+async function attachThumb(img: HTMLImageElement, path: string) {
+  try {
+    const meta = await invoke<FileMeta>("file_meta", { repo: repoPath, path });
+    if (!meta.exists || meta.size > 4 * 1024 * 1024) return;
+    const buf = await invoke<ArrayBuffer>("read_file_bytes", { repo: repoPath, path });
+    const url = URL.createObjectURL(new Blob([buf]));
+    img.onload = () => URL.revokeObjectURL(url);
+    img.onerror = () => URL.revokeObjectURL(url);
+    img.src = url;
+    img.classList.add("loaded");
+  } catch { /* no thumbnail - leave the placeholder */ }
+}
+// Same idea for an Unreal .uasset/.umap: use its extracted embedded thumbnail.
+async function attachUassetThumb(img: HTMLImageElement, path: string) {
+  try {
+    const meta = await invoke<FileMeta>("file_meta", { repo: repoPath, path });
+    if (!meta.exists || meta.size > 64 * 1024 * 1024) return;
+    const buf = await invoke<ArrayBuffer>("read_uasset_thumb", { repo: repoPath, path });
+    const url = URL.createObjectURL(new Blob([buf]));
+    img.onload = () => URL.revokeObjectURL(url);
+    img.onerror = () => URL.revokeObjectURL(url);
+    img.src = url;
+    img.classList.add("loaded");
+  } catch { /* no embedded thumbnail */ }
+}
+
+// Keep the master checkbox honest: checked only when every file is checked,
+// indeterminate when some are.
+function onFileCheckChange() { updateCommitButton(); syncMasterCheck(); }
+function syncMasterCheck() {
+  const boxes = [...document.querySelectorAll<HTMLInputElement>("#file-list .file-check")];
+  const checked = boxes.filter((b) => b.checked).length;
+  const master = $("check-all") as HTMLInputElement;
+  master.checked = boxes.length > 0 && checked === boxes.length;
+  master.indeterminate = checked > 0 && checked < boxes.length;
+}
+
+// A file row inside a commit's changed-files tree (no checkbox/discard).
+// Clicking shows the line diff, or a preview for pictures/models still on disk.
+function commitFileRow(f: FileChange, name: string, depth: number, source: string, target: string, box: HTMLElement): HTMLElement {
+  const row = document.createElement("div");
+  row.className = "tree-file";
+  row.dataset.path = f.path;
+  row.style.paddingLeft = indent(depth);
+  const nm = document.createElement("span");
+  nm.className = "tree-file-name";
+  nm.textContent = name;
+  nm.title = f.path;
+  row.append(statusTag(f.status), fileVisual(f.path), nm);
+  row.addEventListener("click", async () => {
+    box.querySelectorAll(".tree-file").forEach((r) => r.classList.remove("active"));
+    row.classList.add("active");
+    // A deleted file has nothing to preview; previewable files that still exist
+    // on disk get a real preview (of the current file, labelled as such).
+    const k = previewKind(f.path);
+    const previewable = k === "image" || k === "texture" || k === "model" || k === "audio" || k === "uasset" || k === "blend";
+    if (previewable && f.status !== "D") {
+      const meta = await call<FileMeta>("file_meta", { repo: repoPath, path: f.path });
+      if (meta && meta.exists) {
+        if (k === "uasset") await showUassetPreview(f.path);
+        else if (k === "blend") await showBlendPreview(f.path);
+        else await showPreview(f.path, "current file on disk");
+        return;
+      }
+    }
+    showDiffView();
+    const text = await call<string>("lore_commit_file_diff", { repo: repoPath, source, target, path: f.path });
+    renderDiff(text ?? "Could not load diff.");
+  });
+  return row;
 }
 
 function renderStatus(s: StatusInfo) {
@@ -155,50 +436,64 @@ function renderStatus(s: StatusInfo) {
 
   $("commit-branch").textContent = s.branch || "main";
 
-  // file rows
-  const rows: { change: FileChange; staged: boolean }[] = [];
+  // Conflict banner appears while a merge is mid-resolution.
+  const banner = $("conflict-banner");
+  if (s.conflicts.length > 0) {
+    banner.classList.remove("hidden");
+    banner.innerHTML = "";
+    const txt = document.createElement("span");
+    txt.textContent = `${s.conflicts.length} conflict${s.conflicts.length > 1 ? "s" : ""} to resolve`;
+    const btn = document.createElement("button");
+    btn.className = "primary small"; btn.textContent = "Resolve";
+    btn.addEventListener("click", openResolve);
+    banner.append(txt, btn);
+  } else {
+    banner.classList.add("hidden");
+  }
+
+  const rows: FileRow[] = [];
   for (const c of s.staged) rows.push({ change: c, staged: true });
   for (const c of s.unstaged) rows.push({ change: c, staged: false });
   for (const c of s.untracked) rows.push({ change: c, staged: false });
 
-  const list = $("file-list") as HTMLUListElement;
+  const tokens = fileFilter.toLowerCase().split(/[\s,]+/).filter(Boolean);
+  const shown = rows.filter((r) => passesFilter(r.change.path, tokens));
+
+  const list = $("file-list");
   list.innerHTML = "";
-  for (const { change, staged } of rows) {
-    const li = document.createElement("li");
-    li.className = "gh-file";
+  const tree = buildTree(shown.map((r) => ({ path: r.change.path, payload: r })));
+  renderTree(list, tree, 0, changesFileRow);
 
-    const cb = document.createElement("input");
-    cb.type = "checkbox";
-    cb.className = "file-check";
-    cb.dataset.path = change.path;
-    cb.checked = staged;
-    cb.addEventListener("change", updateCommitButton);
+  const total = rows.length;
+  let label: string;
+  if (total === 0) label = "No changes";
+  else if (shown.length === total) label = `${total} changed file${total > 1 ? "s" : ""}`;
+  else label = `${shown.length} of ${total} shown`;
+  $("changes-count").textContent = label;
 
-    const tag = document.createElement("span");
-    tag.className = "tag tag-" + change.status;
-    tag.title = STATUS_LABEL[change.status] ?? change.status;
-    tag.textContent = change.status;
+  const navCount = $("nav-changes-count");
+  navCount.textContent = String(total);
+  navCount.classList.toggle("hidden", total === 0);
 
-    const name = document.createElement("span");
-    name.className = "gh-file-name";
-    name.textContent = change.path;
-    name.title = change.path;
-    name.addEventListener("click", () => showWorkingDiff(change.path));
-
-    const discard = document.createElement("button");
-    discard.className = "row-x";
-    discard.title = "Discard changes to this file";
-    discard.textContent = "⨯";
-    discard.addEventListener("click", (e) => { e.stopPropagation(); discardFiles([change.path]); });
-
-    li.append(cb, tag, name, discard);
-    list.appendChild(li);
-  }
-
-  $("changes-count").textContent =
-    rows.length === 0 ? "No changes" : `${rows.length} changed file${rows.length > 1 ? "s" : ""}`;
-  ($("check-all") as HTMLInputElement).checked = rows.length > 0;
   updateCommitButton();
+  syncMasterCheck();
+}
+
+// A path passes when there is no filter, or its extension equals one of the
+// tokens, or the path simply contains a token (so "char" or ".uasset" both work).
+function passesFilter(path: string, tokens: string[]): boolean {
+  if (tokens.length === 0) return true;
+  const ext = extOf(path);
+  const low = path.toLowerCase();
+  return tokens.some((t) => {
+    const clean = t.startsWith(".") ? t.slice(1) : t;
+    return ext === clean || low.includes(t);
+  });
+}
+
+// Re-render the changes list from the last fetched status (sort/filter changed).
+function rerenderChanges() {
+  if (lastStatus) renderStatus(lastStatus);
 }
 
 function pickedFiles(): string[] {
@@ -238,6 +533,36 @@ async function refreshBranches() {
     const opt = document.createElement("option");
     opt.value = b.name; opt.textContent = b.name;
     merge.appendChild(opt);
+  }
+
+  // Left nav: local branches (click = switch, right-click = operations).
+  const navB = $("nav-branches") as HTMLUListElement;
+  navB.innerHTML = "";
+  for (const b of bl.local) {
+    const li = document.createElement("li");
+    li.className = "nav-list-item" + (b.current ? " current" : "");
+    li.textContent = b.name;
+    li.title = b.name;
+    li.addEventListener("click", () => { if (!b.current) switchBranch(b.name); });
+    li.addEventListener("contextmenu", (e) => { e.preventDefault(); openContextMenu(e.clientX, e.clientY, branchMenu(b)); });
+    navB.appendChild(li);
+  }
+
+  // Left nav: remote branches (display only - Lore tracks these on the server).
+  const navR = $("nav-remotes") as HTMLUListElement;
+  navR.innerHTML = "";
+  for (const b of bl.remote) {
+    const li = document.createElement("li");
+    li.className = "nav-list-item remote";
+    li.textContent = b.name;
+    li.title = b.name;
+    navR.appendChild(li);
+  }
+  if (bl.remote.length === 0) {
+    const li = document.createElement("li");
+    li.className = "nav-empty muted small";
+    li.textContent = "none";
+    navR.appendChild(li);
   }
 }
 
@@ -289,13 +614,159 @@ async function discardAll() {
   await discardFiles(all);
 }
 
-// ---- Working diff (Changes tab) ----
-async function showWorkingDiff(path: string) {
-  showDetail(path, "working changes");
+// ---- Working file view (Changes tab): preview or text diff ----
+async function showWorkingFile(path: string) {
+  showDetail(baseName(path), "Working changes");
   $("detail-files").classList.add("hidden");
   highlightFile(path);
-  const text = await call<string>("lore_diff", { repo: repoPath, path });
-  renderDiff(text ?? "Could not load changes.");
+  const kind = previewKind(path);
+  // Unreal assets try their embedded thumbnail; other binaries get an info card;
+  // text files keep the line diff (unless lore reports it is binary); pictures,
+  // HDR textures, models and audio get a real preview.
+  if (kind === "uasset") { await showUassetPreview(path); return; }
+  if (kind === "blend") { await showBlendPreview(path); return; }
+  if (kind === "binary") { await showInfoCard(path); return; }
+  if (kind === "other") {
+    const text = await call<string>("lore_diff", { repo: repoPath, path });
+    if (text && /binary files differ/i.test(text)) { await showInfoCard(path); return; }
+    showDiffView();
+    renderDiff(text ?? "Could not load changes.");
+    return;
+  }
+  await showPreview(path);
+}
+
+// Unreal .uasset/.umap: show the embedded editor thumbnail if the asset has one,
+// otherwise fall back to the info card. Real mesh/texture rendering needs the
+// engine, which a web view cannot do.
+async function showUassetPreview(path: string) {
+  disposePreview();
+  $("detail-diff").classList.add("hidden");
+  $("detail-diff").textContent = "";
+  $("diff-toolbar").classList.add("hidden");
+  const host = $("detail-preview");
+  host.classList.remove("hidden");
+  host.innerHTML = `<div class="preview-msg muted">Reading asset…</div>`;
+  const caption = $("preview-caption");
+  caption.classList.remove("hidden");
+  caption.textContent = "Loading…";
+
+  let bytes: ArrayBuffer | null = null;
+  try { bytes = await invoke<ArrayBuffer>("read_uasset_thumb", { repo: repoPath, path }); } catch { bytes = null; }
+  if (bytes && bytes.byteLength > 0) {
+    host.innerHTML = "";
+    const res = await mountPreview(host, bytes, "thumbnail.png");
+    previewCleanup = res.cleanup;
+    caption.textContent = ["Unreal asset - embedded thumbnail", res.info].filter(Boolean).join("  ·  ");
+    return;
+  }
+  await showInfoCard(path);
+}
+
+// Cache converted glb per .blend (by path + size) so re-opening is instant.
+const glbCache = new Map<string, ArrayBuffer>();
+// .blend: convert to glb with a headless Blender, then show it in the same 3D
+// viewer as an FBX (real geometry). The first conversion takes a few seconds.
+async function showBlendPreview(path: string) {
+  disposePreview();
+  $("detail-diff").classList.add("hidden");
+  $("detail-diff").textContent = "";
+  $("diff-toolbar").classList.add("hidden");
+  const host = $("detail-preview");
+  host.classList.remove("hidden");
+  const caption = $("preview-caption");
+  caption.classList.remove("hidden");
+
+  const meta = await call<FileMeta>("file_meta", { repo: repoPath, path });
+  const key = path + ":" + (meta?.size ?? 0);
+  let glb = glbCache.get(key);
+  if (!glb) {
+    host.innerHTML = `<div class="preview-msg muted">Converting with Blender…<br><span class="small">first time can take a few seconds</span></div>`;
+    caption.textContent = "Converting…";
+    try {
+      glb = await invoke<ArrayBuffer>("blend_to_glb", { repo: repoPath, path });
+      glbCache.set(key, glb);
+    } catch (e) {
+      host.innerHTML = `<div class="preview-msg muted">Could not show this .blend in 3D.<br><span class="small">${String(e)}</span></div>`;
+      caption.classList.add("hidden");
+      return;
+    }
+  }
+  host.innerHTML = "";
+  const res = await mountPreview(host, glb, "model.glb");
+  previewCleanup = res.cleanup;
+  caption.textContent = [res.info, humanSize(glb.byteLength)].filter(Boolean).join("  ·  ");
+}
+
+// Honest fallback for binary files we cannot draw (Unreal .uasset, .blend, ...).
+async function showInfoCard(path: string) {
+  disposePreview();
+  $("detail-diff").classList.add("hidden");
+  $("detail-diff").textContent = "";
+  $("diff-toolbar").classList.add("hidden");
+  const host = $("detail-preview");
+  host.classList.remove("hidden");
+  const caption = $("preview-caption");
+  caption.classList.remove("hidden");
+  caption.textContent = path;
+  const meta = await call<FileMeta>("file_meta", { repo: repoPath, path });
+  const ext = (extOf(path) || "file").toUpperCase();
+  host.innerHTML =
+    `<div class="preview-msg muted"><div class="info-ext">${ext}</div>` +
+    `${humanSize(meta?.size ?? 0)}<br><span class="small">${engineHint(extOf(path))}</span></div>`;
+}
+function engineHint(ext: string): string {
+  if (ext === "uasset" || ext === "umap") return "Unreal asset - inline preview needs the editor (thumbnail extraction is a possible future step).";
+  if (ext === "blend") return "Blender file - no inline preview in a web view.";
+  if (ext === "spine") return "Spine project - no inline preview yet.";
+  return "No inline preview for this file type yet.";
+}
+
+// Show an image / 3D model preview of a working-tree file.
+async function showPreview(path: string, captionExtra = "") {
+  disposePreview();
+  const host = $("detail-preview");
+  const caption = $("preview-caption");
+  $("detail-diff").classList.add("hidden");
+  $("detail-diff").textContent = "";
+  $("diff-toolbar").classList.add("hidden");
+  host.classList.remove("hidden");
+  host.innerHTML = `<div class="preview-msg muted">Loading preview…</div>`;
+  caption.classList.remove("hidden");
+  caption.textContent = "Loading…";
+
+  let bytes: ArrayBuffer;
+  try {
+    bytes = await invoke<ArrayBuffer>("read_file_bytes", { repo: repoPath, path });
+  } catch (e) {
+    host.innerHTML = `<div class="preview-msg muted">No preview.<br><span class="small">${String(e)}</span></div>`;
+    caption.classList.add("hidden");
+    return;
+  }
+  host.innerHTML = "";
+  const res = await mountPreview(host, bytes, path);
+  previewCleanup = res.cleanup;
+  const parts = [res.info, humanSize(bytes.byteLength)];
+  if (captionExtra) parts.push(captionExtra);
+  caption.textContent = parts.filter(Boolean).join("  ·  ");
+}
+
+function showDiffView() {
+  disposePreview();
+  $("detail-preview").classList.add("hidden");
+  $("preview-caption").classList.add("hidden");
+  $("detail-diff").classList.remove("hidden");
+}
+
+function disposePreview() {
+  if (previewCleanup) { try { previewCleanup(); } catch { /* ignore cleanup errors */ } previewCleanup = null; }
+  $("detail-preview").innerHTML = "";
+}
+
+function humanSize(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
 }
 
 // ---- History ----
@@ -303,23 +774,99 @@ async function loadHistory() {
   const h = await call<Commit[]>("lore_history", { repo: repoPath });
   if (!h) return;
   history = h;
-  const ul = $("history-list") as HTMLUListElement;
-  ul.innerHTML = "";
+  const box = $("history-list");
+  box.innerHTML = "";
+  $("history-head").textContent = h.length ? `History · ${h.length} revisions` : "History";
   h.forEach((c, i) => {
-    const li = document.createElement("li");
-    li.className = "gh-commit";
-    li.dataset.idx = String(i);
-    const subject = c.message.split("\n")[0] || "(no message)";
-    const top = document.createElement("div");
-    top.className = "gh-commit-subject";
-    top.textContent = (c.is_merge ? "⛙ " : "") + subject;
+    const row = document.createElement("div");
+    row.className = "gh-commit";
+    row.dataset.idx = String(i);
+
+    // Graph rail: a dot on a single lane, with a connecting line drawn in CSS.
+    const rail = document.createElement("div");
+    rail.className = "commit-rail";
+    const dot = document.createElement("span");
+    dot.className = "commit-dot" + (c.is_merge ? " merge" : "");
+    const col = branchColor(c.branch);
+    if (c.is_merge) dot.style.borderColor = col; else dot.style.background = col;
+    rail.appendChild(dot);
+
+    const body = document.createElement("div");
+    body.className = "commit-body";
+    const subject = document.createElement("div");
+    subject.className = "gh-commit-subject";
+    subject.textContent = c.message.split("\n")[0] || "(no message)";
     const meta = document.createElement("div");
     meta.className = "gh-commit-meta muted small";
-    meta.textContent = `rev ${c.revision} · ${shortDate(c.date)}`;
-    li.append(top, meta);
-    li.addEventListener("click", () => showCommit(i));
-    ul.appendChild(li);
+    meta.append(authorAvatar(), document.createTextNode(
+      `${c.is_merge ? "merge · " : ""}rev ${c.revision} · ${shortDate(c.date)}`
+    ));
+    body.append(subject, meta);
+
+    row.append(rail, body);
+    row.addEventListener("click", () => showCommit(i));
+    row.addEventListener("contextmenu", (e) => { e.preventDefault(); openContextMenu(e.clientX, e.clientY, commitMenu(c, i)); });
+    box.appendChild(row);
   });
+}
+
+// A consistent avatar for the repo's committer. Lore records no per-commit
+// author, so every commit shows the same repo identity (no more random colour
+// per commit). With an email identity we pull a Gravatar - which serves its own
+// identicon when there is no photo; otherwise a local initials chip.
+function authorAvatar(): HTMLElement {
+  const el = document.createElement("span");
+  el.className = "avatar";
+  const id = repoIdentity.trim();
+  const gh = repoGithubUser.trim();
+  const seed = gh || id || "anonymous";
+  let hash = 0;
+  for (let i = 0; i < seed.length; i++) hash = (hash * 31 + seed.charCodeAt(i)) >>> 0;
+  el.style.background = `hsl(${hash % 360} 30% 38%)`;
+  el.textContent = (gh || id).replace(/[^a-zA-Z0-9]/g, "").slice(0, 2).toUpperCase() || "?";
+  // A GitHub username is the most reliable photo; else try the email's avatar.
+  if (gh) {
+    setAvatarImage(el, `https://github.com/${encodeURIComponent(gh)}.png?size=48`);
+  } else if (id.includes("@")) {
+    resolveAvatarUrl(id).then((url) => setAvatarImage(el, url)).catch(() => {});
+  }
+  return el;
+}
+function setAvatarImage(el: HTMLElement, url: string) {
+  const probe = new Image();
+  probe.onload = () => { el.style.backgroundImage = `url(${url})`; el.style.backgroundSize = "cover"; el.textContent = ""; };
+  probe.src = url; // on error, keep the initials chip
+}
+// Pick the avatar URL for an email, once per repo (cached). Prefer a GitHub
+// account with that public email; fall back to Gravatar (which serves its own
+// identicon when there is no photo).
+async function resolveAvatarUrl(email: string): Promise<string> {
+  if (avatarUrl) return avatarUrl;
+  try {
+    const res = await fetch(`https://api.github.com/search/users?q=${encodeURIComponent(email)}+in:email`, {
+      headers: { Accept: "application/vnd.github+json" },
+    });
+    if (res.ok) {
+      const data = await res.json();
+      const url: string | undefined = data?.items?.[0]?.avatar_url;
+      if (url) { avatarUrl = url + (url.includes("?") ? "&" : "?") + "s=48"; return avatarUrl; }
+    }
+  } catch { /* offline or rate-limited - fall through to Gravatar */ }
+  avatarUrl = await gravatarUrl(email);
+  return avatarUrl;
+}
+async function gravatarUrl(email: string): Promise<string> {
+  const data = new TextEncoder().encode(email.trim().toLowerCase());
+  const buf = await crypto.subtle.digest("SHA-256", data);
+  const hex = [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  return `https://www.gravatar.com/avatar/${hex}?d=identicon&s=48`;
+}
+// Steady colour per branch id, to tell branches apart in the history graph.
+function branchColor(branch: string): string {
+  if (!branch) return "var(--ink-2)";
+  let h = 0;
+  for (let i = 0; i < branch.length; i++) h = (h * 31 + branch.charCodeAt(i)) >>> 0;
+  return `hsl(${h % 360} 45% 58%)`;
 }
 
 async function showCommit(i: number) {
@@ -331,21 +878,22 @@ async function showCommit(i: number) {
 
   showDetail(c.message.split("\n")[0] || "(no message)", `rev ${c.revision} · ${c.date}`);
 
-  // actions: Revert (any), Undo (latest only)
+  // actions: Revert (quick) + More… (full revision/branch operations menu).
   const actions = $("detail-actions");
   actions.innerHTML = "";
   const revert = document.createElement("button");
   revert.className = "ghost small";
-  revert.textContent = "Revert this commit";
+  revert.textContent = "Revert";
   revert.addEventListener("click", () => revertCommit(c));
-  actions.appendChild(revert);
-  if (i === 0 && parent) {
-    const undo = document.createElement("button");
-    undo.className = "ghost small";
-    undo.textContent = "Undo (remove this commit)";
-    undo.addEventListener("click", () => undoCommit(parent));
-    actions.appendChild(undo);
-  }
+  const more = document.createElement("button");
+  more.className = "ghost small";
+  more.textContent = "More…";
+  more.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const r = more.getBoundingClientRect();
+    openContextMenu(r.left, r.bottom + 4, commitMenu(c, i));
+  });
+  actions.append(revert, more);
 
   // changed files in this commit (needs a parent to diff against)
   const filesBox = $("detail-files");
@@ -365,26 +913,10 @@ async function showCommit(i: number) {
     filesBox.innerHTML = `<div class="muted small">No file changes.</div>`;
     return;
   }
-  for (const f of files) {
-    const row = document.createElement("div");
-    row.className = "detail-file-row";
-    const tag = document.createElement("span");
-    tag.className = "tag tag-" + f.status;
-    tag.textContent = f.status;
-    const name = document.createElement("span");
-    name.className = "gh-file-name";
-    name.textContent = f.path;
-    row.append(tag, name);
-    row.addEventListener("click", async () => {
-      filesBox.querySelectorAll(".detail-file-row").forEach((r) => r.classList.remove("active"));
-      row.classList.add("active");
-      const text = await call<string>("lore_commit_file_diff", {
-        repo: repoPath, source: parent.signature, target: c.signature, path: f.path,
-      });
-      renderDiff(text ?? "Could not load diff.");
-    });
-    filesBox.appendChild(row);
-  }
+  const tree = buildTree(files.map((f) => ({ path: f.path, payload: f })));
+  renderTree(filesBox, tree, 0, (node, depth) =>
+    commitFileRow(node.payload as FileChange, node.name, depth, parent.signature, c.signature, filesBox)
+  );
 }
 
 async function revertCommit(c: Commit) {
@@ -402,6 +934,163 @@ async function undoCommit(parent: Commit) {
   if (out !== null) { clearDetail(); await refreshAll(); await loadHistory(); }
 }
 
+// ---- Context menu (commits + branches) ----
+interface CtxItem { label?: string; danger?: boolean; sep?: boolean; run?: () => void; }
+
+function openContextMenu(x: number, y: number, items: CtxItem[]) {
+  closeAllPopovers();
+  const menu = $("ctx-menu");
+  menu.innerHTML = "";
+  for (const it of items) {
+    if (it.sep) {
+      const d = document.createElement("div");
+      d.className = "popover-divider";
+      menu.appendChild(d);
+      continue;
+    }
+    const b = document.createElement("button");
+    b.className = "popover-item" + (it.danger ? " danger" : "");
+    b.textContent = it.label ?? "";
+    b.addEventListener("click", () => { closeAllPopovers(); it.run?.(); });
+    menu.appendChild(b);
+  }
+  menu.classList.remove("hidden");
+  // Keep the menu inside the window.
+  const r = menu.getBoundingClientRect();
+  menu.style.left = Math.min(x, window.innerWidth - r.width - 8) + "px";
+  menu.style.top = Math.min(y, window.innerHeight - r.height - 8) + "px";
+}
+
+function commitMenu(c: Commit, i: number): CtxItem[] {
+  const isLatest = i === 0;
+  const parent = history[i + 1];
+  const items: CtxItem[] = [
+    { label: "Sync working tree to here", run: () => syncToRevision(c) },
+    { label: "Create branch here…", run: () => createBranchAt(c) },
+    { label: "Reset current branch to here", danger: true, run: () => resetBranchTo(c) },
+    { sep: true },
+    { label: "Cherry-pick onto current", run: () => cherryPick(c) },
+    { label: "Revert this revision", run: () => revertCommit(c) },
+  ];
+  if (isLatest) items.push({ label: "Amend message…", run: () => amendLatest(c) });
+  if (isLatest && parent) items.push({ label: "Undo (remove this commit)", danger: true, run: () => undoCommit(parent) });
+  items.push({ sep: true });
+  items.push({ label: "Revision info", run: () => revisionInfo(c) });
+  items.push({ label: "Copy revision id", run: () => navigator.clipboard?.writeText(c.signature) });
+  return items;
+}
+
+function branchMenu(b: Branch): CtxItem[] {
+  const items: CtxItem[] = [];
+  if (!b.current) {
+    items.push({ label: "Switch to this branch", run: () => switchBranch(b.name) });
+    items.push({ label: "Merge into current…", run: () => openMergeFor(b.name) });
+  }
+  items.push({ label: "Push branch", run: () => branchPush(b.name) });
+  items.push({ label: "Branch info", run: () => branchInfo(b.name) });
+  items.push({ sep: true });
+  items.push({ label: "Protect", run: () => branchProtect(b.name, true) });
+  items.push({ label: "Unprotect", run: () => branchProtect(b.name, false) });
+  if (!b.current) {
+    items.push({ sep: true });
+    items.push({ label: "Archive (remove) branch", danger: true, run: () => branchArchive(b.name) });
+  }
+  return items;
+}
+
+// ---- Revision ops ----
+async function syncToRevision(c: Commit) {
+  if (!confirm(`Sync the working tree to revision ${c.revision}? Local changes may be affected.`)) return;
+  const out = await call<string>("lore_revision_sync", { repo: repoPath, revision: c.signature });
+  if (out !== null) { clearDetail(); await refreshAll(); await loadHistory(); }
+}
+async function createBranchAt(c: Commit) {
+  const name = await askText("New branch name", "The branch is created at the selected revision.");
+  if (!name) return;
+  const out = await call<string>("lore_branch_create_at", { repo: repoPath, name: name.trim(), revision: c.signature });
+  if (out !== null) await refreshBranches();
+}
+async function resetBranchTo(c: Commit) {
+  if (!confirm(`Move the current branch to revision ${c.revision}? This rewrites local history after it.`)) return;
+  const out = await call<string>("lore_branch_reset", { repo: repoPath, revision: c.signature });
+  if (out !== null) { clearDetail(); await refreshAll(); await loadHistory(); }
+}
+async function cherryPick(c: Commit) {
+  if (!confirm(`Cherry-pick revision ${c.revision} onto the current revision?`)) return;
+  const out = await call<string>("lore_revision_cherry_pick", { repo: repoPath, revision: c.signature });
+  if (out !== null) { warnIfConflict(out); clearDetail(); await refreshAll(); await loadHistory(); }
+}
+async function amendLatest(c: Commit) {
+  const msg = await askText("New message for the latest commit", "", c.message.split("\n")[0]);
+  if (!msg) return;
+  const out = await call<string>("lore_revision_amend", { repo: repoPath, message: msg.trim() });
+  if (out !== null) { await refreshAll(); await loadHistory(); }
+}
+async function revisionInfo(c: Commit) {
+  const out = await call<string>("lore_revision_info", { repo: repoPath, revision: c.signature });
+  if (out !== null) showTextDetail(`Revision ${c.revision}`, c.signature, out);
+}
+
+// ---- Branch ops ----
+async function branchPush(name: string) {
+  const out = await call<string>("lore_branch_push", { repo: repoPath, name });
+  if (out !== null) await refreshAll();
+}
+async function branchInfo(name: string) {
+  const out = await call<string>("lore_branch_info", { repo: repoPath, name });
+  if (out !== null) showTextDetail(`Branch ${name}`, "", out);
+}
+async function branchProtect(name: string, on: boolean) {
+  const out = await call<string>("lore_branch_protect", { repo: repoPath, name, protect: on });
+  if (out !== null) await refreshBranches();
+}
+async function branchArchive(name: string) {
+  if (!confirm(`Archive (remove) branch "${name}"? This cannot be undone here.`)) return;
+  const out = await call<string>("lore_branch_archive", { repo: repoPath, name });
+  if (out !== null) { await refreshBranches(); if (!$("pane-history").classList.contains("hidden")) loadHistory(); }
+}
+function openMergeFor(name: string) {
+  openMergeModal();
+  const sel = $("merge-source") as HTMLSelectElement;
+  if ([...sel.options].some((o) => o.value === name)) sel.value = name;
+}
+function warnIfConflict(out: string) {
+  if (/conflict/i.test(out)) {
+    alert("This left conflicts. For now, resolve or abort it from the Console (the resolve / abort subcommands).");
+  }
+}
+
+// Show plain command text (revision / branch info / lock status) in the detail pane.
+function showTextDetail(title: string, sub: string, text: string) {
+  showDetail(title, sub);
+  $("detail-files").classList.add("hidden");
+  showDiffView();
+  $("diff-toolbar").classList.add("hidden");
+  const out = $("detail-diff");
+  out.classList.remove("split");
+  out.textContent = text;
+}
+
+// ---- File ops (right-click a changed file) ----
+function fileMenu(path: string): CtxItem[] {
+  return [
+    { label: "Lock file", run: () => lockFile(path, true) },
+    { label: "Unlock file", run: () => lockFile(path, false) },
+    { label: "Lock status", run: () => lockStatus(path) },
+    { sep: true },
+    { label: "Discard changes", danger: true, run: () => discardFiles([path]) },
+    { label: "Copy path", run: () => navigator.clipboard?.writeText(path) },
+  ];
+}
+async function lockFile(path: string, lock: boolean) {
+  const out = await call<string>(lock ? "lore_lock_acquire" : "lore_lock_release", { repo: repoPath, path });
+  if (out !== null) alert(out.trim() || (lock ? "Locked." : "Unlocked."));
+}
+async function lockStatus(path: string) {
+  const out = await call<string>("lore_lock_status", { repo: repoPath, path });
+  if (out !== null) showTextDetail("Lock status", path, out.trim() || "No lock information.");
+}
+
 function shortDate(d: string): string {
   // "Wed, 17 Jun 2026 21:13:57 +0000" -> "17 Jun 2026"
   const m = d.match(/(\d{1,2} \w{3} \d{4})/);
@@ -417,19 +1106,33 @@ function showDetail(title: string, sub: string) {
   $("detail-actions").innerHTML = "";
 }
 function clearDetail() {
+  disposePreview();
   $("detail").classList.add("hidden");
   $("detail-empty").classList.remove("hidden");
   $("detail-diff").textContent = "";
+  $("detail-diff").classList.remove("hidden", "split");
   $("detail-files").classList.add("hidden");
+  $("detail-preview").classList.add("hidden");
+  $("preview-caption").classList.add("hidden");
+  $("diff-toolbar").classList.add("hidden");
 }
 function highlightFile(path: string) {
-  document.querySelectorAll("#file-list .gh-file").forEach((li) => {
-    const cb = li.querySelector(".file-check") as HTMLInputElement;
-    li.classList.toggle("active", cb?.dataset.path === path);
-  });
+  document.querySelectorAll("#file-list .tree-file").forEach((el) =>
+    el.classList.toggle("active", (el as HTMLElement).dataset.path === path)
+  );
 }
+// Render the diff in the current mode (unified or side-by-side) and reveal the
+// toggle. Keeps the text so the toggle can re-render without re-fetching.
 function renderDiff(text: string) {
+  lastDiffText = text;
+  $("diff-toolbar").classList.remove("hidden");
+  ($("diff-mode") as HTMLElement).textContent = diffMode === "split" ? "Unified" : "Side by side";
+  if (diffMode === "split") renderDiffSplit(text);
+  else renderDiffUnified(text);
+}
+function renderDiffUnified(text: string) {
   const out = $("detail-diff") as HTMLPreElement;
+  out.classList.remove("split");
   out.innerHTML = "";
   for (const line of text.split("\n")) {
     const span = document.createElement("span");
@@ -445,13 +1148,83 @@ function diffLineClass(line: string): string {
   return "dl-ctx";
 }
 
-// ---- Tabs ----
-function showTab(name: "changes" | "history") {
+// ---- Side-by-side diff ----
+interface SbsRow { type: "ctx" | "add" | "del" | "chg" | "meta"; oldNum?: number; newNum?: number; oldText?: string; newText?: string; }
+// Turn a unified diff into aligned old/new rows. Runs of removals and additions
+// are paired so a change shows old on the left, new on the right.
+function parseSideBySide(text: string): SbsRow[] {
+  const rows: SbsRow[] = [];
+  const lines = text.split("\n");
+  let oldN = 0, newN = 0, i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (line.startsWith("@@")) {
+      const m = line.match(/@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+      if (m) { oldN = parseInt(m[1], 10); newN = parseInt(m[2], 10); }
+      rows.push({ type: "meta", oldText: line });
+      i++; continue;
+    }
+    if (line.startsWith("+++") || line.startsWith("---") || line.startsWith("diff ") || line.startsWith("index ")) {
+      rows.push({ type: "meta", oldText: line }); i++; continue;
+    }
+    if ((line.startsWith("-") && !line.startsWith("---")) || (line.startsWith("+") && !line.startsWith("+++"))) {
+      const dels: string[] = [], adds: string[] = [];
+      while (i < lines.length && lines[i].startsWith("-") && !lines[i].startsWith("---")) { dels.push(lines[i].slice(1)); i++; }
+      while (i < lines.length && lines[i].startsWith("+") && !lines[i].startsWith("+++")) { adds.push(lines[i].slice(1)); i++; }
+      const n = Math.max(dels.length, adds.length);
+      for (let k = 0; k < n; k++) {
+        const d = dels[k], a = adds[k];
+        const row: SbsRow = { type: d !== undefined && a !== undefined ? "chg" : d !== undefined ? "del" : "add" };
+        if (d !== undefined) { row.oldText = d; row.oldNum = oldN++; }
+        if (a !== undefined) { row.newText = a; row.newNum = newN++; }
+        rows.push(row);
+      }
+      continue;
+    }
+    const t = line.startsWith(" ") ? line.slice(1) : line;
+    rows.push({ type: "ctx", oldText: t, newText: t, oldNum: oldN++, newNum: newN++ });
+    i++;
+  }
+  return rows;
+}
+function renderDiffSplit(text: string) {
+  const out = $("detail-diff") as HTMLPreElement;
+  out.classList.add("split");
+  out.innerHTML = "";
+  const grid = document.createElement("div");
+  grid.className = "diff-split";
+  for (const row of parseSideBySide(text)) {
+    if (row.type === "meta") {
+      const m = document.createElement("div");
+      m.className = "dmeta"; m.textContent = row.oldText ?? "";
+      grid.appendChild(m);
+      continue;
+    }
+    const leftCls = row.type === "del" || row.type === "chg" ? "dl-del" : row.type === "ctx" ? "dl-ctx" : "";
+    const rightCls = row.type === "add" || row.type === "chg" ? "dl-add" : row.type === "ctx" ? "dl-ctx" : "";
+    grid.append(
+      sbsCell(row.oldNum, "dn"),
+      sbsCell(row.oldText, "dc " + leftCls),
+      sbsCell(row.newNum, "dn"),
+      sbsCell(row.newText, "dc " + rightCls),
+    );
+  }
+  out.appendChild(grid);
+}
+function sbsCell(val: string | number | undefined, cls: string): HTMLElement {
+  const d = document.createElement("div");
+  d.className = cls;
+  d.textContent = val === undefined ? "" : String(val);
+  return d;
+}
+
+// ---- Left nav (Changes / History) ----
+function selectNav(name: "changes" | "history") {
   const ch = name === "changes";
   $("pane-changes").classList.toggle("hidden", !ch);
   $("pane-history").classList.toggle("hidden", ch);
-  $("tab-changes").classList.toggle("active", ch);
-  $("tab-history").classList.toggle("active", !ch);
+  $("nav-changes").classList.toggle("active", ch);
+  $("nav-history").classList.toggle("active", !ch);
   clearDetail();
   if (ch) refreshStatus();
   else loadHistory();
@@ -462,6 +1235,37 @@ function refreshOnFocus() {
   if (!repoPath || $("app").classList.contains("hidden")) return;
   if (!$("pane-history").classList.contains("hidden")) loadHistory();
   else refreshStatus();
+}
+
+// Drag the splitter to resize the changes/history panel - lets the user widen it
+// to read long file names, or shrink it for more preview room. Width is saved.
+function setupSplitter() {
+  const splitter = $("side-splitter");
+  const side = document.querySelector(".gh-side") as HTMLElement;
+  const saved = localStorage.getItem("sideWidth");
+  if (saved) side.style.width = saved + "px";
+  let dragging = false;
+  splitter.addEventListener("mousedown", (e) => {
+    dragging = true;
+    splitter.classList.add("dragging");
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    e.preventDefault();
+  });
+  document.addEventListener("mousemove", (e) => {
+    if (!dragging) return;
+    const left = side.getBoundingClientRect().left;
+    const w = Math.max(220, Math.min(760, e.clientX - left));
+    side.style.width = w + "px";
+  });
+  document.addEventListener("mouseup", () => {
+    if (!dragging) return;
+    dragging = false;
+    splitter.classList.remove("dragging");
+    document.body.style.cursor = "";
+    document.body.style.userSelect = "";
+    localStorage.setItem("sideWidth", String(Math.round(side.getBoundingClientRect().width)));
+  });
 }
 
 // ---- Console ----
@@ -562,12 +1366,69 @@ async function doMerge() {
   if (!msg) { alert("Write a short message for the merge."); return; }
   $("merge-overlay").classList.add("hidden");
   const out = await call<string>("lore_merge_branch", { repo: repoPath, source, message: msg });
-  if (out !== null) {
-    if (/[1-9]\d* conflicted/.test(out) || /conflict/i.test(out)) {
-      alert("This merge has conflicts. v1 cannot resolve those here - use the Console or ask your programmer.");
-    }
-    clearDetail(); await refreshAll();
+  if (out === null) return;
+  clearDetail();
+  await refreshAll();
+  // Conflicts left behind? Open the resolve panel.
+  if ((lastStatus?.conflicts.length ?? 0) > 0 || /conflict/i.test(out)) openResolve();
+}
+
+// ---- Merge conflict resolve ----
+function openResolve() {
+  renderResolve();
+  $("resolve-overlay").classList.remove("hidden");
+}
+function renderResolve() {
+  const list = $("resolve-list");
+  list.innerHTML = "";
+  const conflicts = lastStatus?.conflicts ?? [];
+  if (conflicts.length === 0) {
+    list.innerHTML = `<div class="muted small">No conflicted files detected. If Lore still reports a merge in progress, use Finish or Abort.</div>`;
+    return;
   }
+  for (const c of conflicts) {
+    const row = document.createElement("div");
+    row.className = "resolve-row";
+    const nm = document.createElement("span");
+    nm.className = "resolve-name"; nm.textContent = c.path; nm.title = c.path;
+    const mine = document.createElement("button");
+    mine.className = "ghost small"; mine.textContent = "Use mine";
+    mine.addEventListener("click", () => resolveSide("mine", c.path));
+    const theirs = document.createElement("button");
+    theirs.className = "ghost small"; theirs.textContent = "Use theirs";
+    theirs.addEventListener("click", () => resolveSide("theirs", c.path));
+    const acts = document.createElement("div");
+    acts.className = "resolve-acts"; acts.append(mine, theirs);
+    row.append(nm, acts);
+    list.appendChild(row);
+  }
+}
+async function resolveSide(side: "mine" | "theirs", path?: string) {
+  const paths = path ? [path] : [];
+  const out = await call<string>("lore_merge_resolve", { repo: repoPath, side, paths });
+  if (out === null) return;
+  await refreshStatus();
+  renderResolve();
+}
+async function finishMerge() {
+  const out = await call<string>("lore_merge_finish", { repo: repoPath });
+  if (out === null) return;
+  if (/conflict/i.test(out)) {
+    alert("Still conflicts to resolve:\n\n" + out.trim());
+    await refreshStatus(); renderResolve(); return;
+  }
+  $("resolve-overlay").classList.add("hidden");
+  clearDetail();
+  await refreshAll();
+  if (!$("pane-history").classList.contains("hidden")) loadHistory();
+}
+async function abortMerge() {
+  if (!confirm("Abort the merge and discard the in-progress merge state?")) return;
+  const out = await call<string>("lore_merge_abort", { repo: repoPath });
+  if (out === null) return;
+  $("resolve-overlay").classList.add("hidden");
+  clearDetail();
+  await refreshAll();
 }
 
 // ---- Settings (global lore flags) ----
@@ -656,6 +1517,100 @@ async function stopServerClicked() {
   const out = await call<string>("lore_stop_server");
   if (out !== null) await refreshServerStatus();
 }
+
+// ---- Server setup wizard ----
+function portOf(addr: string): string {
+  const m = addr.match(/:(\d+)/);
+  return m ? m[1] : "";
+}
+function setSetupMode(mode: "host" | "connect") {
+  document.querySelectorAll<HTMLInputElement>('input[name="setupmode"]').forEach((r) => (r.checked = r.value === mode));
+  $("setup-host").classList.toggle("hidden", mode !== "host");
+  $("setup-connect").classList.toggle("hidden", mode !== "connect");
+  document.querySelectorAll(".setup-card").forEach((c) => {
+    const r = c.querySelector("input") as HTMLInputElement;
+    c.classList.toggle("selected", r.checked);
+  });
+}
+// Build the shareable address from this PC's LAN IP (fetched once) + the port.
+async function refreshSetupShare() {
+  const port = ($("setup-port") as HTMLInputElement).value.trim() || "41337";
+  if (setupLanIp === undefined) {
+    try { setupLanIp = await invoke<string | null>("local_ip"); } catch { setupLanIp = null; }
+  }
+  if (setupLanIp) {
+    $("setup-share-url").textContent = `lore://${setupLanIp}:${port}`;
+    $("setup-host-note").textContent = "loreserver listens on all interfaces by default, so teammates on your LAN or VPN can reach this once your firewall allows port 41337 (TCP+UDP). On Tailscale, share your 100.x address. Note: the quick local server stores data in a temp folder - run loreserver with a --config for a persistent team server.";
+  } else {
+    $("setup-share-url").textContent = `lore://127.0.0.1:${port}`;
+    $("setup-host-note").textContent = "No LAN address found - others can only reach you over a shared LAN or VPN (e.g. Tailscale).";
+  }
+}
+async function refreshSetupServerState() {
+  const local = "lore://127.0.0.1:" + (($("setup-port") as HTMLInputElement).value.trim() || "41337");
+  let up = false;
+  try { up = await invoke<boolean>("lore_server_status", { baseUrl: local }); } catch { up = false; }
+  $("setup-server-state").textContent = up ? "Status: running" : "Status: not running";
+  const toggle = $("setup-server-toggle") as HTMLButtonElement;
+  toggle.textContent = up ? "Stop server" : "Start server";
+  toggle.dataset.up = up ? "1" : "0";
+}
+async function toggleSetupServer() {
+  const toggle = $("setup-server-toggle") as HTMLButtonElement;
+  const wasUp = toggle.dataset.up === "1";
+  toggle.disabled = true;
+  try {
+    if (wasUp) await invoke("lore_stop_server");
+    else await invoke("lore_start_server");
+  } catch (e) { alert(String(e)); }
+  for (let i = 0; i < 8; i++) {
+    await sleep(800);
+    await refreshSetupServerState();
+    if ((toggle.dataset.up === "1") !== wasUp) break;
+  }
+  toggle.disabled = false;
+  refreshServerStatus();
+}
+async function testSetupConnection() {
+  const addr = ($("setup-addr") as HTMLInputElement).value.trim();
+  const state = $("setup-test-state");
+  if (!addr) { state.textContent = "Type an address first."; return; }
+  state.textContent = "Checking…";
+  let up = false;
+  try { up = await invoke<boolean>("lore_server_status", { baseUrl: addr }); } catch { up = false; }
+  state.textContent = up ? "Connected ✓" : "No answer ✗";
+}
+function openSetup() {
+  closeAllPopovers();
+  const addr = getServerAddr();
+  const local = isLocalAddr(addr);
+  ($("setup-port") as HTMLInputElement).value = portOf(addr) || "41337";
+  ($("setup-addr") as HTMLInputElement).value = local ? "" : addr;
+  $("setup-test-state").textContent = "";
+  setSetupMode(local ? "host" : "connect");
+  refreshSetupShare();
+  refreshSetupServerState();
+  $("setup-overlay").classList.remove("hidden");
+}
+async function saveSetup() {
+  const mode = (document.querySelector('input[name="setupmode"]:checked') as HTMLInputElement)?.value || "host";
+  let addr: string;
+  if (mode === "host") {
+    const port = ($("setup-port") as HTMLInputElement).value.trim() || "41337";
+    // The app drives a local server over loopback; the LAN address is only for sharing.
+    addr = `lore://127.0.0.1:${port}`;
+  } else {
+    addr = ($("setup-addr") as HTMLInputElement).value.trim();
+    if (!addr) { alert("Type the server address to connect to."); return; }
+  }
+  const saved = JSON.parse(localStorage.getItem(SET_KEY) || "{}");
+  saved.serveraddr = addr;
+  localStorage.setItem(SET_KEY, JSON.stringify(saved));
+  ($("set-serveraddr") as HTMLInputElement).value = addr;
+  $("setup-overlay").classList.add("hidden");
+  await ensureServer();
+}
+
 function buildGlobals(): string[] {
   const g: string[] = [];
   const source = (document.querySelector('input[name="source"]:checked') as HTMLInputElement)?.value;
@@ -674,12 +1629,36 @@ function updateSettingsPreview() {
 function openSettings() {
   const saved = JSON.parse(localStorage.getItem(SET_KEY) || "{}");
   objectToSettings(saved);
+  // Per-repo identity lives in the project's config, not the global settings.
+  ($("set-repoidentity") as HTMLInputElement).value = repoIdentity;
+  ($("set-repoidentity") as HTMLInputElement).disabled = !repoPath;
+  ($("set-ghuser") as HTMLInputElement).value = repoGithubUser;
+  ($("set-ghuser") as HTMLInputElement).disabled = !repoPath;
   updateSettingsPreview();
   $("settings-overlay").classList.remove("hidden");
 }
 async function saveSettings() {
   localStorage.setItem(SET_KEY, JSON.stringify(settingsToObject()));
   await invoke("lore_set_globals", { globals: buildGlobals() });
+  if (repoPath) {
+    let avatarChanged = false;
+    const newGh = ($("set-ghuser") as HTMLInputElement).value.trim();
+    if (newGh !== repoGithubUser) {
+      repoGithubUser = newGh;
+      if (newGh) localStorage.setItem(ghUserKey(repoPath), newGh);
+      else localStorage.removeItem(ghUserKey(repoPath));
+      avatarChanged = true;
+    }
+    const newId = ($("set-repoidentity") as HTMLInputElement).value.trim();
+    if (newId !== repoIdentity) {
+      const out = await invoke<string>("lore_set_identity", { repo: repoPath, identity: newId }).catch((e) => { alert(String(e)); return null; });
+      if (out !== null) { repoIdentity = newId; avatarChanged = true; }
+    }
+    if (avatarChanged) {
+      avatarUrl = null;
+      if (!$("pane-history").classList.contains("hidden")) loadHistory();
+    }
+  }
   $("settings-overlay").classList.add("hidden");
   if (repoPath) refreshAll();
 }
@@ -697,7 +1676,7 @@ window.addEventListener("DOMContentLoaded", () => {
   $("create-btn").addEventListener("click", createProject);
   $("create-btn-2").addEventListener("click", createProject);
 
-  $("proj-btn").addEventListener("click", (e) => { e.stopPropagation(); openPopover($("proj-menu"), $("proj-btn")); });
+  $("proj-btn").addEventListener("click", (e) => { e.stopPropagation(); renderRecent(); openPopover($("proj-menu"), $("proj-btn")); });
   $("branch-btn").addEventListener("click", (e) => { e.stopPropagation(); openPopover($("branch-menu"), $("branch-btn")); });
   $("sync-btn").addEventListener("click", syncAction);
   $("newbranch-btn").addEventListener("click", newBranch);
@@ -706,8 +1685,20 @@ window.addEventListener("DOMContentLoaded", () => {
   $("merge-cancel").addEventListener("click", () => $("merge-overlay").classList.add("hidden"));
   $("merge-overlay").addEventListener("click", (e) => { if (e.target === $("merge-overlay")) $("merge-overlay").classList.add("hidden"); });
 
-  $("tab-changes").addEventListener("click", () => showTab("changes"));
-  $("tab-history").addEventListener("click", () => showTab("history"));
+  // Merge conflict resolve.
+  $("merge-finish").addEventListener("click", finishMerge);
+  $("merge-abort").addEventListener("click", abortMerge);
+  $("resolve-all-mine").addEventListener("click", () => resolveSide("mine"));
+  $("resolve-all-theirs").addEventListener("click", () => resolveSide("theirs"));
+
+  // Don't let the webview remember/autofill text inputs (e.g. commit messages).
+  document.querySelectorAll("input").forEach((i) => i.setAttribute("autocomplete", "off"));
+
+  $("nav-changes").addEventListener("click", () => selectNav("changes"));
+  $("nav-history").addEventListener("click", () => selectNav("history"));
+  $("nav-newbranch").addEventListener("click", (e) => { e.stopPropagation(); newBranch(); });
+  $("sort-mode").addEventListener("change", (e) => { fileSort = (e.target as HTMLSelectElement).value as "name" | "type"; rerenderChanges(); });
+  $("filter-ext").addEventListener("input", (e) => { fileFilter = (e.target as HTMLInputElement).value; rerenderChanges(); });
 
   $("save-btn").addEventListener("click", save);
   $("commit-msg").addEventListener("input", updateCommitButton);
@@ -716,8 +1707,9 @@ window.addEventListener("DOMContentLoaded", () => {
   window.addEventListener("focus", refreshOnFocus);
   document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshOnFocus(); });
   $("check-all").addEventListener("change", (e) => {
-    const on = (e.target as HTMLInputElement).checked;
-    document.querySelectorAll<HTMLInputElement>(".file-check").forEach((b) => (b.checked = on));
+    const master = e.target as HTMLInputElement;
+    master.indeterminate = false;
+    document.querySelectorAll<HTMLInputElement>("#file-list .file-check").forEach((b) => (b.checked = master.checked));
     updateCommitButton();
   });
 
@@ -729,12 +1721,32 @@ window.addEventListener("DOMContentLoaded", () => {
   $("settings-save").addEventListener("click", saveSettings);
   $("settings-cancel").addEventListener("click", () => $("settings-overlay").classList.add("hidden"));
   $("settings-overlay").addEventListener("click", (e) => { if (e.target === $("settings-overlay")) $("settings-overlay").classList.add("hidden"); });
+
+  // Server setup wizard.
+  $("setup-btn-2").addEventListener("click", openSetup);
+  $("server-setup").addEventListener("click", openSetup);
+  $("setup-cancel").addEventListener("click", () => $("setup-overlay").classList.add("hidden"));
+  $("setup-overlay").addEventListener("click", (e) => { if (e.target === $("setup-overlay")) $("setup-overlay").classList.add("hidden"); });
+  $("setup-save").addEventListener("click", saveSetup);
+  $("setup-copy").addEventListener("click", () => navigator.clipboard?.writeText($("setup-share-url").textContent || ""));
+  $("setup-server-toggle").addEventListener("click", toggleSetupServer);
+  $("setup-test").addEventListener("click", testSetupConnection);
+  $("setup-port").addEventListener("input", () => { refreshSetupShare(); refreshSetupServerState(); });
+  document.querySelectorAll('input[name="setupmode"]').forEach((r) =>
+    r.addEventListener("change", () => setSetupMode((r as HTMLInputElement).value as "host" | "connect"))
+  );
   document.querySelectorAll("#settings-overlay input, #settings-overlay select")
     .forEach((el) => el.addEventListener("change", updateSettingsPreview));
   applySavedGlobals();
   $("cmd-run").addEventListener("click", () => runConsole());
   $("cmd-input").addEventListener("keydown", (e) => { if ((e as KeyboardEvent).key === "Enter") runConsole(); });
   buildCommandList();
+  setupSplitter();
+  $("diff-mode").addEventListener("click", () => {
+    diffMode = diffMode === "split" ? "unified" : "split";
+    localStorage.setItem("diffMode", diffMode);
+    if (lastDiffText) renderDiff(lastDiffText);
+  });
 
   // Close popovers on outside click / Escape.
   document.addEventListener("click", (e) => {
