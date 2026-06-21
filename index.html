@@ -16,6 +16,7 @@
       <div class="welcome-actions">
         <button id="open-btn-2" class="primary">Open project</button>
         <button id="create-btn-2">New project</button>
+        <button id="clone-btn-2">Clone from server</button>
         <button id="setup-btn-2" class="ghost">Set up a server</button>
       </div>
     </div>
@@ -39,8 +40,14 @@
         </button>
         <button id="sync-btn" class="gh-dd gh-sync">
           <span class="gh-dd-col">
-            <span id="sync-title" class="gh-dd-value">Sync</span>
+            <span id="sync-title" class="gh-dd-value">Get latest</span>
             <span id="sync-sub" class="gh-dd-label">—</span>
+          </span>
+        </button>
+        <button id="push-btn" class="gh-dd gh-sync hidden">
+          <span class="gh-dd-col">
+            <span class="gh-dd-value">Push</span>
+            <span id="push-sub" class="gh-dd-label">send your commits</span>
           </span>
         </button>
         <div class="gh-spacer"></div>
@@ -61,7 +68,7 @@
               <span class="nav-ic">◆</span><span class="nav-label">Changes</span>
               <span id="nav-changes-count" class="nav-count hidden"></span>
             </button>
-            <button id="nav-history" class="nav-item">
+            <button id="nav-history" class="nav-item active">
               <span class="nav-ic">⟲</span><span class="nav-label">History</span>
             </button>
           </div>
@@ -109,7 +116,7 @@
           </div>
 
           <!-- History -->
-          <div id="pane-history" class="gh-pane hidden">
+          <div id="pane-history" class="gh-pane">
             <div class="gh-list-head">
               <span id="history-head" class="muted small">History</span>
             </div>
@@ -162,8 +169,10 @@ This runs the real lore CLI - anything the CLI does, you can do here.</pre>
       <div class="popover-path" id="proj-path"></div>
       <ul id="recent-list" class="popover-list hidden"></ul>
       <div class="popover-divider"></div>
+      <button id="reveal-repo-btn" class="popover-item">Reveal repo in Explorer</button>
       <button id="open-btn" class="popover-item">Open another project…</button>
       <button id="create-btn" class="popover-item">New project…</button>
+      <button id="clone-btn" class="popover-item">Clone from server…</button>
     </div>
 
     <div id="server-menu" class="popover hidden">
@@ -186,6 +195,20 @@ This runs the real lore CLI - anything the CLI does, you can do here.</pre>
 
     <!-- Right-click context menu (commits + branches), filled at runtime -->
     <div id="ctx-menu" class="popover ctx-menu hidden"></div>
+
+    <div id="toast" class="toast"></div>
+
+    <div id="switch-overlay" class="overlay hidden">
+      <div class="ask-box">
+        <h2>Switch to <span id="switch-target"></span></h2>
+        <p class="muted small"><span id="switch-count"></span> uncommitted change(s). They live in your working folder, not a branch. To save them, Cancel and commit first (Lore has no stash). Otherwise:</p>
+        <div class="ask-actions switch-actions">
+          <button id="switch-cancel" class="ghost">Cancel</button>
+          <button id="switch-reset" class="ghost">Switch, discard my changes</button>
+          <button id="switch-bring" class="primary">Switch, keep my changes</button>
+        </div>
+      </div>
+    </div>
 
     <!-- ===================== MODALS ===================== -->
     <div id="ask-overlay" class="overlay hidden">
@@ -216,7 +239,8 @@ This runs the real lore CLI - anything the CLI does, you can do here.</pre>
     <div id="resolve-overlay" class="overlay hidden">
       <div class="ask-box resolve-box">
         <h2>Resolve merge conflicts</h2>
-        <p class="muted small">Pick a side per file, or for all. Lore stays mid-merge until you finish or abort.</p>
+        <p class="muted small">Pick a side per file, or for all. Click a file name to see mine vs theirs side by side. Lore stays mid-merge until you finish or abort.</p>
+        <div id="resolve-count" class="muted small"></div>
         <div id="resolve-list" class="resolve-list"></div>
         <div class="resolve-bulk">
           <button id="resolve-all-mine" class="ghost small">Use mine for all</button>
@@ -243,10 +267,14 @@ This runs the real lore CLI - anything the CLI does, you can do here.</pre>
               <input id="set-repoidentity" placeholder="you@example.com" />
             </label>
             <p class="muted small">Saved to this project's <code>.lore/config.toml</code> and used to label your commits. Each project can have its own.</p>
-            <label class="set-field">GitHub username (this repo)
+            <label class="set-field">GitHub username (profile picture)
               <input id="set-ghuser" placeholder="octocat" />
             </label>
-            <p class="muted small">Used to show your GitHub profile picture as the avatar - more reliable than email lookup. Falls back to Gravatar / an identicon.</p>
+            <p class="muted small">Drives the avatar <strong>picture</strong> only - pulls that GitHub account's photo (falls back to Gravatar / an identicon).</p>
+            <label class="set-field">Name shown in history
+              <input id="set-authorname" placeholder="defaults to your identity" />
+            </label>
+            <p class="muted small">The author <strong>name</strong> next to the avatar in History. Separate from the GitHub username, so the two can differ.</p>
           </section>
 
           <section class="set-group">
@@ -346,6 +374,11 @@ This runs the real lore CLI - anything the CLI does, you can do here.</pre>
               <button id="setup-copy" class="ghost small">Copy</button>
             </div>
             <p id="setup-host-note" class="muted small"></p>
+            <div class="setup-store">
+              <input id="setup-store" placeholder="Keep data in this folder (optional)" readonly />
+              <button id="setup-store-browse" class="ghost small">Browse</button>
+            </div>
+            <p class="muted small">Without a folder, the quick server stores data in a temp folder that is lost on restart. Pick one for a persistent team server.</p>
             <div class="setup-server-row">
               <span id="setup-server-state" class="muted small">Status: …</span>
               <button id="setup-server-toggle" class="ghost small">Start server</button>

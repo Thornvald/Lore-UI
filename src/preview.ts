@@ -149,6 +149,39 @@ function disposeScene(root: THREE.Object3D) {
   });
 }
 
+// View modes (Blender-style): a clean matte "solid" clay, wireframe, or normals.
+// We override the model's own materials so a metallic glb/fbx with no environment
+// map stops looking chrome-y and just reads as a solid object.
+type ViewMode = "solid" | "wireframe" | "normals";
+function makeViewMaterial(mode: ViewMode): THREE.Material {
+  if (mode === "normals") return new THREE.MeshNormalMaterial();
+  if (mode === "wireframe") return new THREE.MeshBasicMaterial({ color: 0x9aa0a8, wireframe: true });
+  return new THREE.MeshStandardMaterial({ color: 0x9aa0a8, roughness: 0.6, metalness: 0.0 });
+}
+function applyViewMode(root: THREE.Object3D, mode: ViewMode) {
+  root.traverse((o) => {
+    const mesh = o as THREE.Mesh;
+    if (!mesh.isMesh) return;
+    const existing = mesh.material;
+    if (existing) (Array.isArray(existing) ? existing : [existing]).forEach((m) => m.dispose());
+    mesh.material = makeViewMaterial(mode);
+  });
+}
+// A pleasant 3-point + hemisphere rig that flatters matte surfaces.
+function addStudioLights(scene: THREE.Scene) {
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x2a2a30, 1.5));
+  scene.add(new THREE.AmbientLight(0xffffff, 0.22));
+  const key = new THREE.DirectionalLight(0xffffff, 2.0);
+  key.position.set(2, 3, 2);
+  scene.add(key);
+  const fill = new THREE.DirectionalLight(0xffffff, 0.8);
+  fill.position.set(-2, 1, -1);
+  scene.add(fill);
+  const rim = new THREE.DirectionalLight(0xffffff, 0.6);
+  rim.position.set(0, 2.5, -3);
+  scene.add(rim);
+}
+
 async function mountModel(host: HTMLElement, bytes: ArrayBuffer, ext: string): Promise<PreviewResult> {
   let model: THREE.Object3D;
   try {
@@ -158,6 +191,7 @@ async function mountModel(host: HTMLElement, bytes: ArrayBuffer, ext: string): P
     return { cleanup: () => {}, info: "" };
   }
   prepMeshes(model);
+  applyViewMode(model, "solid"); // clean matte look, no chrome
 
   const stage = document.createElement("div");
   stage.className = "model-stage";
@@ -171,13 +205,30 @@ async function mountModel(host: HTMLElement, bytes: ArrayBuffer, ext: string): P
     return { cleanup: () => {}, info: "" };
   }
   renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.1;
   stage.appendChild(renderer.domElement);
 
+  // View-mode toolbar: Solid / Wireframe / Normals.
+  const tools = document.createElement("div");
+  tools.className = "model-tools";
+  const MODES: ViewMode[] = ["solid", "wireframe", "normals"];
+  const toolBtns: HTMLButtonElement[] = [];
+  for (const m of MODES) {
+    const b = document.createElement("button");
+    b.className = "model-tool" + (m === "solid" ? " on" : "");
+    b.textContent = m[0].toUpperCase() + m.slice(1);
+    b.addEventListener("click", () => {
+      applyViewMode(model, m);
+      toolBtns.forEach((x) => x.classList.toggle("on", x === b));
+    });
+    toolBtns.push(b);
+    tools.appendChild(b);
+  }
+  stage.appendChild(tools);
+
   const scene = new THREE.Scene();
-  scene.add(new THREE.HemisphereLight(0xffffff, 0x404046, 2.2));
-  const key = new THREE.DirectionalLight(0xffffff, 2.6);
-  key.position.set(1, 1.4, 1);
-  scene.add(key);
+  addStudioLights(scene);
 
   const camera = new THREE.PerspectiveCamera(50, 1, 0.01, 100000);
   const controls = new OrbitControls(camera, renderer.domElement);
@@ -253,6 +304,73 @@ function countTriangles(root: THREE.Object3D): number {
     else if (g.attributes.position) n += g.attributes.position.count / 3;
   });
   return Math.round(n);
+}
+
+// ---- Offscreen model thumbnails (for file rows) -----------------------------
+// Browsers cap how many live WebGL contexts exist, so every row thumbnail shares
+// ONE offscreen renderer and the jobs run one at a time. Each job returns a PNG
+// data URL the caller drops into an <img>.
+const THUMB_SIZE = 72;
+let thumbRenderer: THREE.WebGLRenderer | null = null;
+let thumbRendererTried = false;
+function getThumbRenderer(): THREE.WebGLRenderer | null {
+  if (thumbRendererTried) return thumbRenderer;
+  thumbRendererTried = true;
+  try {
+    thumbRenderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, preserveDrawingBuffer: true });
+    thumbRenderer.setSize(THUMB_SIZE, THUMB_SIZE, false);
+    thumbRenderer.outputColorSpace = THREE.SRGBColorSpace;
+    thumbRenderer.toneMapping = THREE.ACESFilmicToneMapping;
+    thumbRenderer.toneMappingExposure = 1.1;
+  } catch {
+    thumbRenderer = null;
+  }
+  return thumbRenderer;
+}
+
+// Serialize jobs onto one chain so we never render two models into the shared
+// context at once.
+let thumbChain: Promise<unknown> = Promise.resolve();
+export function renderModelThumbnail(bytes: ArrayBuffer, ext: string): Promise<string | null> {
+  const job = thumbChain.then(() => renderModelThumbnailNow(bytes, ext));
+  thumbChain = job.catch(() => null);
+  return job;
+}
+
+async function renderModelThumbnailNow(bytes: ArrayBuffer, ext: string): Promise<string | null> {
+  const renderer = getThumbRenderer();
+  if (!renderer) return null;
+  let model: THREE.Object3D;
+  try {
+    model = await loadModel(bytes, ext);
+  } catch {
+    return null;
+  }
+  prepMeshes(model);
+  applyViewMode(model, "solid");
+
+  const scene = new THREE.Scene();
+  addStudioLights(scene);
+  scene.add(model);
+
+  const camera = new THREE.PerspectiveCamera(50, 1, 0.01, 100000);
+  const box = new THREE.Box3().setFromObject(model);
+  const size = box.getSize(new THREE.Vector3());
+  const center = box.getCenter(new THREE.Vector3());
+  const maxDim = Math.max(size.x, size.y, size.z) || 1;
+  const fov = (camera.fov * Math.PI) / 180;
+  // Tight framing so the model fills the little row thumbnail.
+  const dist = ((maxDim / 2) / Math.tan(fov / 2)) * 1.15;
+  camera.position.set(center.x + dist * 0.65, center.y + dist * 0.5, center.z + dist);
+  camera.near = dist / 100;
+  camera.far = dist * 100;
+  camera.updateProjectionMatrix();
+  camera.lookAt(center);
+
+  renderer.render(scene, camera);
+  const url = renderer.domElement.toDataURL("image/png");
+  disposeScene(scene);
+  return url;
 }
 
 // ---- HDR texture preview (exr / hdr) ----------------------------------------

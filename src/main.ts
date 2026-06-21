@@ -2,7 +2,7 @@ import "@fontsource-variable/geist";
 import "@fontsource-variable/geist-mono";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import { mountPreview, previewKind, extOf } from "./preview";
+import { mountPreview, previewKind, extOf, renderModelThumbnail } from "./preview";
 
 // ---- Types mirror the Rust serde structs ----
 interface FileChange { status: "A" | "M" | "D"; path: string; }
@@ -25,6 +25,7 @@ interface Commit {
   revision: string;
   signature: string;
   branch: string;
+  merge_parent: string;
   date: string;
   message: string;
   is_merge: boolean;
@@ -75,11 +76,19 @@ const LORE_COMMANDS: { cmd: string; desc: string }[] = [
 // ---- State ----
 let repoPath = "";
 let history: Commit[] = [];
+// Parallel to `history` (which is the flattened display order, this branch plus
+// any merged-in branch commits): the real parent to diff each row against, and
+// which lane it sits in (0 = this branch, 1 = a merged-in branch).
+let histParents: (Commit | undefined)[] = [];
+let histLanes: number[] = [];
 let consoleOn = false;
 // Cleanup for the live preview (image object URL / three.js context), if any.
 let previewCleanup: (() => void) | null = null;
 // This machine's LAN IP, fetched once for the server setup share line.
 let setupLanIp: string | null | undefined = undefined;
+// This machine's Tailscale (100.x) IP, if on a tailnet - preferred for sharing
+// with a remote friend over Tailscale.
+let setupTsIp: string | null | undefined = undefined;
 // Last status, kept so sort/filter can re-render the list without re-fetching.
 let lastStatus: StatusInfo | null = null;
 let fileSort: "name" | "type" = "name";
@@ -89,10 +98,17 @@ let fileFilter = "";
 let repoIdentity = "";
 // Cached avatar URL for the repo identity (GitHub or Gravatar), resolved once.
 let avatarUrl: string | null = null;
-// Optional GitHub username for this repo (UI-only, stored locally) - the most
-// reliable way to show a real profile picture.
+// The avatar URL we have already confirmed loads. Once known, every avatar chip
+// applies it synchronously instead of re-probing - that stops the photo from
+// flashing back to initials each time the History view re-renders.
+let avatarReadyUrl: string | null = null;
+// Optional GitHub username for this repo (UI-only, stored locally) - drives the
+// avatar PICTURE only.
 let repoGithubUser = "";
 const ghUserKey = (repo: string) => "ghUser:" + repo;
+// Optional display name shown in History (separate from the GitHub username).
+let repoAuthorName = "";
+const authorNameKey = (repo: string) => "authorName:" + repo;
 // Diff display mode + the last diff text, so the toggle can re-render in place.
 let diffMode: "unified" | "split" = localStorage.getItem("diffMode") === "split" ? "split" : "unified";
 let lastDiffText = "";
@@ -119,7 +135,11 @@ async function openProject() {
   if (!picked || typeof picked !== "string") return;
   const isRepo = await invoke<boolean>("lore_is_repo", { repo: picked });
   if (!isRepo) {
-    alert("That folder is not a Lore project.\nPick a folder that has a .lore folder inside.");
+    // A plain folder is not a repo yet. Rather than dead-ending, offer to make it
+    // one - that is what the user usually means by "open a new project here".
+    if (confirm(`"${baseName(picked)}" is not a Lore project yet.\n\nCreate a new Lore project in this folder?`)) {
+      await createProjectAt(picked);
+    }
     return;
   }
   await enterProject(picked);
@@ -127,8 +147,33 @@ async function openProject() {
 
 async function createProject() {
   closeAllPopovers();
-  const picked = await open({ directory: true, title: "Pick an empty folder for the new project" });
+  const picked = await open({ directory: true, title: "Pick a folder for the new project" });
   if (!picked || typeof picked !== "string") return;
+  await createProjectAt(picked);
+}
+// Clone an existing repo from any Lore server (localhost, LAN, VPS, Tailscale,
+// VLAN - just a lore://host:port/name URL) into a chosen folder, then open it.
+async function cloneProject() {
+  closeAllPopovers();
+  const url = await askText(
+    "Repository URL to clone",
+    "lore://HOST:PORT/name  -  the server address (your friend's VPS / Tailscale 100.x / LAN IP) and the repo name",
+    `${getServerAddr()}/`
+  );
+  if (!url) return;
+  const parent = await open({ directory: true, title: "Pick a folder to clone the project into" });
+  if (!parent || typeof parent !== "string") return;
+  try {
+    const dest = await invoke<string>("lore_clone", { url: url.trim(), parent });
+    await enterProject(dest);
+  } catch (e) {
+    alert("Could not clone the project.\n\n" + String(e));
+  }
+}
+
+// Create a Lore repo in an existing folder, then open it. Shared by the Create
+// button and by Open-on-a-plain-folder.
+async function createProjectAt(picked: string) {
   if (await invoke<boolean>("lore_is_repo", { repo: picked })) {
     alert("That folder is already a Lore project. Use Open instead.");
     return;
@@ -192,13 +237,20 @@ async function enterProject(path: string) {
   addRecentProject(path);
   repoIdentity = await invoke<string>("lore_identity", { repo: path }).catch(() => "");
   repoGithubUser = localStorage.getItem(ghUserKey(path)) || "";
+  repoAuthorName = localStorage.getItem(authorNameKey(path)) || "";
   avatarUrl = null; // re-resolve the avatar for this repo's identity
+  avatarReadyUrl = null;
   $("proj-name").textContent = baseName(path);
   $("proj-path").textContent = path;
   $("empty").classList.add("hidden");
   $("app").classList.remove("hidden");
   clearDetail();
+  // First time an Unreal project is opened, set up its .loreignore + store cap so
+  // the first scan below already skips the derived folders. Idempotent: it does
+  // nothing on later opens, so we never reconfigure an already-set-up project.
+  const unrealAdded = await invoke<boolean>("ensure_unreal_setup", { repo: path }).catch(() => false);
   await refreshAll();
+  if (unrealAdded) showToast("Unreal project - added .loreignore and raised the store size");
 }
 
 function baseName(p: string): string {
@@ -319,7 +371,7 @@ function changesFileRow(node: TreeNode, depth: number): HTMLElement {
 
   row.append(cb, statusTag(r.change.status), fileVisual(r.change.path), nm, discard);
 
-  row.addEventListener("click", () => showWorkingFile(r.change.path));
+  row.addEventListener("click", () => showWorkingFile(r.change.path, r.change.status));
   row.addEventListener("contextmenu", (e) => { e.preventDefault(); openContextMenu(e.clientX, e.clientY, fileMenu(r.change.path)); });
   return row;
 }
@@ -331,10 +383,45 @@ function fileVisual(path: string): HTMLElement {
   const kind = previewKind(path);
   if (kind === "image") { const img = thumbImg(); attachThumb(img, path); return img; }
   if (kind === "uasset") { const img = thumbImg(); attachUassetThumb(img, path); return img; }
+  if (kind === "model") { const img = thumbImg(); attachModelThumb(img, path); return img; }
+  if (kind === "blend") { const img = thumbImg(); attachBlendThumb(img, path); return img; }
   const ic = document.createElement("span");
   ic.className = "row-icon";
   ic.textContent = kindGlyph(kind);
   return ic;
+}
+// Cache rendered model thumbnails (data URLs) by path+size so list refreshes and
+// re-opens are instant.
+const modelThumbCache = new Map<string, string>();
+// Render a tiny 3D thumbnail for a model row in the background. Big models are
+// skipped (do not read a 200 MB fbx for a 72px square).
+async function attachModelThumb(img: HTMLImageElement, path: string) {
+  try {
+    const meta = await invoke<FileMeta>("file_meta", { repo: repoPath, path });
+    if (!meta.exists || meta.size > 48 * 1024 * 1024) return;
+    const key = path + ":" + meta.size;
+    const cached = modelThumbCache.get(key);
+    if (cached) { img.src = cached; img.classList.add("loaded"); return; }
+    const buf = await readFileBytesCached(path, meta.size);
+    const url = await renderModelThumbnail(buf, extOf(path));
+    if (url) { modelThumbCache.set(key, url); img.src = url; img.classList.add("loaded"); }
+  } catch { /* keep the icon */ }
+}
+// Blend rows get a 3D thumbnail too - but only once the file has a cached glb
+// (converting every .blend in a list would be far too slow). A blend gets cached
+// the first time it is opened in the preview pane.
+async function attachBlendThumb(img: HTMLImageElement, path: string) {
+  try {
+    const cached = await invoke<boolean>("blend_is_cached", { repo: repoPath, path });
+    if (!cached) return; // leave the placeholder; opening it once will cache it
+    const meta = await invoke<FileMeta>("file_meta", { repo: repoPath, path });
+    const key = "blend:" + path + ":" + (meta?.size ?? 0);
+    const hit = modelThumbCache.get(key);
+    if (hit) { img.src = hit; img.classList.add("loaded"); return; }
+    const glb = await invoke<ArrayBuffer>("blend_to_glb", { repo: repoPath, path });
+    const url = await renderModelThumbnail(glb, "glb");
+    if (url) { modelThumbCache.set(key, url); img.src = url; img.classList.add("loaded"); }
+  } catch { /* keep the icon */ }
 }
 function thumbImg(): HTMLImageElement {
   const img = document.createElement("img");
@@ -351,13 +438,25 @@ function kindGlyph(kind: string): string {
     default: return "≡";
   }
 }
+// Cache raw file bytes (keyed by path+size) so a row thumbnail and the big
+// preview of the same file don't each read + parse it from disk. Bounded.
+const fileBytesCache = new Map<string, ArrayBuffer>();
+async function readFileBytesCached(path: string, size: number): Promise<ArrayBuffer> {
+  const key = path + ":" + size;
+  const hit = fileBytesCache.get(key);
+  if (hit) return hit;
+  const buf = await invoke<ArrayBuffer>("read_file_bytes", { repo: repoPath, path });
+  fileBytesCache.set(key, buf);
+  if (fileBytesCache.size > 6) { const k = fileBytesCache.keys().next().value; if (k) fileBytesCache.delete(k); }
+  return buf;
+}
 // Load a small inline thumbnail for an image row (skips big/missing files so a
 // 4K texture does not get read just to draw a 20px square).
 async function attachThumb(img: HTMLImageElement, path: string) {
   try {
     const meta = await invoke<FileMeta>("file_meta", { repo: repoPath, path });
     if (!meta.exists || meta.size > 4 * 1024 * 1024) return;
-    const buf = await invoke<ArrayBuffer>("read_file_bytes", { repo: repoPath, path });
+    const buf = await readFileBytesCached(path, meta.size);
     const url = URL.createObjectURL(new Blob([buf]));
     img.onload = () => URL.revokeObjectURL(url);
     img.onerror = () => URL.revokeObjectURL(url);
@@ -417,6 +516,11 @@ function commitFileRow(f: FileChange, name: string, depth: number, source: strin
         else await showPreview(f.path, "current file on disk");
         return;
       }
+      // Previewable but not in the working tree - Lore can't extract a past
+      // binary, so show an info card instead of a raw "Binary files differ".
+      await showInfoCard(f.path);
+      $("preview-caption").textContent = `${f.path} · not in your working tree (can't preview a past binary)`;
+      return;
     }
     showDiffView();
     const text = await call<string>("lore_commit_file_diff", { repo: repoPath, source, target, path: f.path });
@@ -425,14 +529,31 @@ function commitFileRow(f: FileChange, name: string, depth: number, source: strin
   return row;
 }
 
+// The Push button shows when there is something to send: the branch is ahead /
+// diverged, OR it has no copy on the remote yet. A freshly created or switched
+// branch that was never pushed is reported by lore as "in sync", so without this
+// the button would never appear and the user could not push it up.
+function updatePushButton() {
+  const s = lastStatus;
+  const sync = (s?.sync_state || "").toLowerCase();
+  // Drive Push off the sync state from THIS status call - it is authoritative and
+  // never stale. "in sync" means the commit already reached the server (Lore is
+  // centralized), so showing Push then is wrong - it read as "not pushed yet" on
+  // an already-pushed branch. Only a genuinely ahead/diverged branch has anything
+  // to send.
+  const ahead = sync.includes("ahead") || sync.includes("diverged");
+  $("push-btn").classList.toggle("hidden", !ahead);
+  if (ahead) $("push-sub").textContent = "send your commits";
+}
+
 function renderStatus(s: StatusInfo) {
-  // sync button
-  const sync = s.sync_state || "";
-  const title = $("sync-title");
-  const sub = $("sync-sub");
-  if (sync.includes("ahead")) { title.textContent = "Push"; sub.textContent = "send your commits"; }
-  else if (sync.includes("behind")) { title.textContent = "Get latest"; sub.textContent = "behind remote"; }
-  else { title.textContent = "Get latest"; sub.textContent = "up to date"; }
+  // Get-latest is always available; Push shows only when there is something to send.
+  const sync = (s.sync_state || "").toLowerCase();
+  const behind = sync.includes("behind") || sync.includes("diverged");
+  // Get latest only ever reports the INCOMING side - being ahead is the Push
+  // button's job, so showing "ahead of remote" here read as a contradiction.
+  $("sync-sub").textContent = behind ? "remote has changes" : "up to date";
+  updatePushButton();
 
   $("commit-branch").textContent = s.branch || "main";
 
@@ -564,11 +685,32 @@ async function refreshBranches() {
     li.textContent = "none";
     navR.appendChild(li);
   }
+  // Branch list just changed - the Push button depends on whether the current
+  // branch has a remote copy, so re-evaluate it now that we know.
+  updatePushButton();
 }
 
+function dirtyCount(): number {
+  const s = lastStatus;
+  if (!s) return 0;
+  return s.staged.length + s.unstaged.length + s.untracked.length + s.conflicts.length;
+}
 async function switchBranch(name: string) {
-  const out = await call<string>("lore_switch_branch", { repo: repoPath, name });
+  const n = dirtyCount();
+  if (n > 0) { openSwitchGuard(name, n); return; }
+  await doSwitch(name, false);
+}
+async function doSwitch(name: string, reset: boolean) {
+  const out = await call<string>("lore_switch_branch", { repo: repoPath, name, reset });
   if (out !== null) { clearDetail(); await refreshAll(); }
+  else { await refreshBranches(); } // switch failed (e.g. stale branch) - re-sync the nav
+}
+let switchTargetName = "";
+function openSwitchGuard(name: string, n: number) {
+  switchTargetName = name;
+  $("switch-target").textContent = name;
+  $("switch-count").textContent = String(n);
+  $("switch-overlay").classList.remove("hidden");
 }
 
 async function newBranch() {
@@ -576,6 +718,17 @@ async function newBranch() {
   const name = await askText("Name for the new branch", "Letters, numbers, dashes.");
   if (!name) return;
   const out = await call<string>("lore_create_branch", { repo: repoPath, name: name.trim() });
+  if (out !== null) await refreshBranches();
+}
+// Create a new branch starting at another branch's latest revision (works for
+// the current branch too).
+async function createBranchFrom(b: Branch) {
+  const name = await askText(`New branch from "${b.name}"`, "Letters, numbers, dashes.");
+  if (!name) return;
+  const info = await call<string>("lore_branch_info", { repo: repoPath, name: b.name });
+  if (info === null) return;
+  const m = info.match(/Latest\s*:\s*([0-9a-f]+)/i);
+  const out = await call<string>("lore_branch_create_at", { repo: repoPath, name: name.trim(), revision: m ? m[1] : "" });
   if (out !== null) await refreshBranches();
 }
 
@@ -592,10 +745,42 @@ async function save() {
 }
 
 async function syncAction() {
-  const title = $("sync-title").textContent || "";
-  const cmd = title === "Push" ? "lore_push" : "lore_sync";
-  const out = await call<string>(cmd, { repo: repoPath });
+  const out = await call<string>("lore_sync", { repo: repoPath });
   if (out !== null) await refreshAll();
+}
+async function pushAction() {
+  try {
+    const out = await invoke<string>("lore_push", { repo: repoPath });
+    await refreshAll();
+    showToast(/already pushed|already at remote|remote latest|up to date|up-to-date|nothing to push/i.test(out || "")
+      ? "Already up to date" : "Pushed to remote");
+  } catch (e) {
+    const msg = String(e);
+    // Diverged: the remote moved on too. Offer to Get latest (merge) then push.
+    if (/diverg|sync/i.test(msg)) {
+      if (confirm("Can't push - the remote has commits you don't have yet. Get latest to merge them first, then push again?\n\nGet latest now?")) {
+        const s = await call<string>("lore_sync", { repo: repoPath });
+        if (s !== null) await refreshAll();
+      }
+      return;
+    }
+    // "Missing fragments": this project's local store thinks its file data is
+    // already on the server, so push sends nothing, but the server doesn't have
+    // it. The server itself is fine (other projects push). No in-app retry fixes
+    // this stale state - the project has to be re-created.
+    if (/missing fragments/i.test(msg)) {
+      alert(
+        "Can't push - this project thinks its files are already on the server, so it sends " +
+        "nothing, but the server doesn't have them.\n\n" +
+        "The server itself is working (other projects push fine) - this is this project's own " +
+        "upload record being out of sync, which a push can't repair.\n\n" +
+        "Fix: re-create the project - close it, delete its .lore folder, then use Create to make " +
+        "a fresh one on the server and commit + push again."
+      );
+      return;
+    }
+    alert(msg);
+  }
 }
 
 // ---- Discard ----
@@ -615,10 +800,20 @@ async function discardAll() {
 }
 
 // ---- Working file view (Changes tab): preview or text diff ----
-async function showWorkingFile(path: string) {
-  showDetail(baseName(path), "Working changes");
+async function showWorkingFile(path: string, status = "M") {
+  showDetail(baseName(path), status === "D" ? "Deleted - last committed content" : "Working changes");
   $("detail-files").classList.add("hidden");
   highlightFile(path);
+  // A deleted file is gone from disk, so we can't render it - but `lore diff`
+  // still shows its removed content. Route deletes to the diff instead of a dead
+  // "No preview".
+  if (status === "D") {
+    const text = await call<string>("lore_diff", { repo: repoPath, path });
+    if (text && /binary files differ/i.test(text)) { await showInfoCard(path); return; }
+    showDiffView();
+    renderDiff(text ?? "Could not load the removed content.");
+    return;
+  }
   const kind = previewKind(path);
   // Unreal assets try their embedded thumbnail; other binaries get an info card;
   // text files keep the line diff (unless lore reports it is binary); pictures,
@@ -696,6 +891,8 @@ async function showBlendPreview(path: string) {
   const res = await mountPreview(host, glb, "model.glb");
   previewCleanup = res.cleanup;
   caption.textContent = [res.info, humanSize(glb.byteLength)].filter(Boolean).join("  ·  ");
+  // The file now has a cached glb, so its row can show a 3D thumbnail.
+  if (!$("pane-changes").classList.contains("hidden")) rerenderChanges();
 }
 
 // Honest fallback for binary files we cannot draw (Unreal .uasset, .blend, ...).
@@ -737,7 +934,8 @@ async function showPreview(path: string, captionExtra = "") {
 
   let bytes: ArrayBuffer;
   try {
-    bytes = await invoke<ArrayBuffer>("read_file_bytes", { repo: repoPath, path });
+    const meta = await call<FileMeta>("file_meta", { repo: repoPath, path });
+    bytes = await readFileBytesCached(path, meta?.size ?? 0);
   } catch (e) {
     host.innerHTML = `<div class="preview-msg muted">No preview.<br><span class="small">${String(e)}</span></div>`;
     caption.classList.add("hidden");
@@ -773,16 +971,56 @@ function humanSize(n: number): string {
 async function loadHistory() {
   const h = await call<Commit[]>("lore_history", { repo: repoPath });
   if (!h) return;
-  history = h;
+  const mainSigs = new Set(h.map((c) => c.signature));
+  // For a merge whose second parent lives on another branch, pull that branch's
+  // own commits (`history --revision <sig> --only-branch`) so we can show them as
+  // a second lane instead of a dead-end merge dot.
+  const subBySig = new Map<string, Commit[]>();
+  await Promise.all(
+    h.filter((c) => c.is_merge && c.merge_parent && !mainSigs.has(c.merge_parent)).map(async (c) => {
+      // Use invoke + catch (not call) so a missing command on an older build, or
+      // an unreachable revision, just skips the sub-lane instead of popping an alert.
+      const sub = await invoke<Commit[]>("lore_history_from", { repo: repoPath, revision: c.merge_parent }).catch(() => null);
+      if (sub && sub.length) subBySig.set(c.signature, sub);
+    })
+  );
+  // Flatten into display order: this branch in lane 0, each merged-in branch's
+  // unique commits in lane 1 right under the merge that brought them in.
+  const flat: Commit[] = [];
+  const parents: (Commit | undefined)[] = [];
+  const lanes: number[] = [];
+  const seen = new Set<string>();
+  for (let k = 0; k < h.length; k++) {
+    const c = h[k];
+    if (!seen.has(c.signature)) {
+      seen.add(c.signature);
+      flat.push(c); parents.push(h[k + 1]); lanes.push(0);
+    }
+    const sub = subBySig.get(c.signature);
+    if (!sub) continue;
+    const fresh = sub.filter((s) => !mainSigs.has(s.signature));
+    const base = sub.find((s) => mainSigs.has(s.signature)); // shared fork point
+    for (let m = 0; m < fresh.length; m++) {
+      const s = fresh[m];
+      if (seen.has(s.signature)) continue;
+      seen.add(s.signature);
+      flat.push(s); parents.push(fresh[m + 1] ?? base); lanes.push(1);
+    }
+  }
+  history = flat;
+  histParents = parents;
+  histLanes = lanes;
+
   const box = $("history-list");
   box.innerHTML = "";
   $("history-head").textContent = h.length ? `History · ${h.length} revisions` : "History";
-  h.forEach((c, i) => {
+  history.forEach((c, i) => {
     const row = document.createElement("div");
-    row.className = "gh-commit";
+    row.className = "gh-commit" + (histLanes[i] ? " lane-sub" : "");
     row.dataset.idx = String(i);
+    row.dataset.sig = c.signature;
 
-    // Graph rail: a dot on a single lane, with a connecting line drawn in CSS.
+    // Graph rail: a dot on its lane, with a connecting line drawn in CSS.
     const rail = document.createElement("div");
     rail.className = "commit-rail";
     const dot = document.createElement("span");
@@ -798,8 +1036,17 @@ async function loadHistory() {
     subject.textContent = c.message.split("\n")[0] || "(no message)";
     const meta = document.createElement("div");
     meta.className = "gh-commit-meta muted small";
-    meta.append(authorAvatar(), document.createTextNode(
-      `${c.is_merge ? "merge · " : ""}rev ${c.revision} · ${shortDate(c.date)}`
+    meta.append(authorAvatar());
+    // Lore has no per-commit author - show the display name (or identity) if set.
+    const who = repoAuthorName.trim() || repoIdentity.trim();
+    if (who) {
+      const name = document.createElement("span");
+      name.className = "commit-author";
+      name.textContent = who;
+      meta.append(name);
+    }
+    meta.append(document.createTextNode(
+      `${c.is_merge ? " merge · " : " "}rev ${c.revision} · ${shortDate(c.date)}`
     ));
     body.append(subject, meta);
 
@@ -808,6 +1055,42 @@ async function loadHistory() {
     row.addEventListener("contextmenu", (e) => { e.preventDefault(); openContextMenu(e.clientX, e.clientY, commitMenu(c, i)); });
     box.appendChild(row);
   });
+  requestAnimationFrame(() => drawMergeLines(box));
+}
+
+// How far the merged-in lane is pushed right from the main lane (keep in sync
+// with the .lane-sub rail padding in CSS).
+const LANE_INDENT = 16;
+// Draw a curved connector from each merge commit to the revision it merged in
+// (its second parent). With a merged-in branch woven in, that revision is now a
+// real row in lane 1, so the curve reaches the actual merged commit.
+function drawMergeLines(box: HTMLElement) {
+  box.querySelector(".merge-svg")?.remove();
+  const rows = [...box.querySelectorAll<HTMLElement>(".gh-commit")];
+  if (rows.length === 0) return;
+  const sigToIdx = new Map(history.map((c, i) => [c.signature, i]));
+  const svgNS = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(svgNS, "svg");
+  svg.setAttribute("class", "merge-svg");
+  svg.style.cssText = `position:absolute;left:0;top:0;width:60px;height:${box.scrollHeight}px;pointer-events:none;`;
+  const dotY = (el: HTMLElement) => el.offsetTop + el.offsetHeight / 2;
+  const laneX = (i: number) => 13 + (histLanes[i] ? LANE_INDENT : 0);
+  let drew = false;
+  history.forEach((c, i) => {
+    if (!c.is_merge || !c.merge_parent) return;
+    const j = sigToIdx.get(c.merge_parent);
+    if (j === undefined || j === i || !rows[j]) return;
+    const x1 = laneX(i), x2 = laneX(j), y1 = dotY(rows[i]), y2 = dotY(rows[j]);
+    const path = document.createElementNS(svgNS, "path");
+    path.setAttribute("d", `M ${x1} ${y1} C ${(x1 + x2) / 2} ${y1}, ${x2} ${(y1 + y2) / 2}, ${x2} ${y2}`);
+    path.setAttribute("fill", "none");
+    path.setAttribute("stroke", branchColor(c.branch));
+    path.setAttribute("stroke-width", "2");
+    path.setAttribute("opacity", "0.85");
+    svg.appendChild(path);
+    drew = true;
+  });
+  if (drew) { box.style.position = "relative"; box.insertBefore(svg, box.firstChild); }
 }
 
 // A consistent avatar for the repo's committer. Lore records no per-commit
@@ -819,22 +1102,37 @@ function authorAvatar(): HTMLElement {
   el.className = "avatar";
   const id = repoIdentity.trim();
   const gh = repoGithubUser.trim();
-  const seed = gh || id || "anonymous";
+  const label = repoAuthorName.trim() || gh || id;
+  const seed = label || "anonymous";
   let hash = 0;
   for (let i = 0; i < seed.length; i++) hash = (hash * 31 + seed.charCodeAt(i)) >>> 0;
   el.style.background = `hsl(${hash % 360} 30% 38%)`;
-  el.textContent = (gh || id).replace(/[^a-zA-Z0-9]/g, "").slice(0, 2).toUpperCase() || "?";
+  el.textContent = label.replace(/[^a-zA-Z0-9]/g, "").slice(0, 2).toUpperCase() || "?";
   // A GitHub username is the most reliable photo; else try the email's avatar.
   if (gh) {
-    setAvatarImage(el, `https://github.com/${encodeURIComponent(gh)}.png?size=48`);
+    applyAvatar(el, `https://github.com/${encodeURIComponent(gh)}.png?size=48`);
   } else if (id.includes("@")) {
-    resolveAvatarUrl(id).then((url) => setAvatarImage(el, url)).catch(() => {});
+    if (avatarReadyUrl) applyAvatar(el, avatarReadyUrl);
+    else resolveAvatarUrl(id).then((url) => applyAvatar(el, url)).catch(() => {});
   }
   return el;
 }
-function setAvatarImage(el: HTMLElement, url: string) {
+function applyAvatar(el: HTMLElement, url: string) {
+  // Already confirmed loadable: the browser has the bytes, so paint it now with
+  // no probe and no initials flash.
+  if (avatarReadyUrl === url) {
+    el.style.backgroundImage = `url(${url})`;
+    el.style.backgroundSize = "cover";
+    el.textContent = "";
+    return;
+  }
   const probe = new Image();
-  probe.onload = () => { el.style.backgroundImage = `url(${url})`; el.style.backgroundSize = "cover"; el.textContent = ""; };
+  probe.onload = () => {
+    avatarReadyUrl = url;
+    el.style.backgroundImage = `url(${url})`;
+    el.style.backgroundSize = "cover";
+    el.textContent = "";
+  };
   probe.src = url; // on error, keep the initials chip
 }
 // Pick the avatar URL for an email, once per repo (cached). Prefer a GitHub
@@ -871,7 +1169,7 @@ function branchColor(branch: string): string {
 
 async function showCommit(i: number) {
   const c = history[i];
-  const parent = history[i + 1]; // older commit, or undefined for the first
+  const parent = histParents[i]; // real parent for this row (handles woven lanes)
   document.querySelectorAll(".gh-commit").forEach((el) =>
     el.classList.toggle("active", (el as HTMLElement).dataset.idx === String(i))
   );
@@ -963,7 +1261,7 @@ function openContextMenu(x: number, y: number, items: CtxItem[]) {
 
 function commitMenu(c: Commit, i: number): CtxItem[] {
   const isLatest = i === 0;
-  const parent = history[i + 1];
+  const parent = histParents[i];
   const items: CtxItem[] = [
     { label: "Sync working tree to here", run: () => syncToRevision(c) },
     { label: "Create branch here…", run: () => createBranchAt(c) },
@@ -982,6 +1280,7 @@ function commitMenu(c: Commit, i: number): CtxItem[] {
 
 function branchMenu(b: Branch): CtxItem[] {
   const items: CtxItem[] = [];
+  items.push({ label: "Create branch from this…", run: () => createBranchFrom(b) });
   if (!b.current) {
     items.push({ label: "Switch to this branch", run: () => switchBranch(b.name) });
     items.push({ label: "Merge into current…", run: () => openMergeFor(b.name) });
@@ -993,7 +1292,7 @@ function branchMenu(b: Branch): CtxItem[] {
   items.push({ label: "Unprotect", run: () => branchProtect(b.name, false) });
   if (!b.current) {
     items.push({ sep: true });
-    items.push({ label: "Archive (remove) branch", danger: true, run: () => branchArchive(b.name) });
+    items.push({ label: "Delete branch (archive)", danger: true, run: () => branchArchive(b.name) });
   }
   return items;
 }
@@ -1045,9 +1344,22 @@ async function branchProtect(name: string, on: boolean) {
   if (out !== null) await refreshBranches();
 }
 async function branchArchive(name: string) {
-  if (!confirm(`Archive (remove) branch "${name}"? This cannot be undone here.`)) return;
-  const out = await call<string>("lore_branch_archive", { repo: repoPath, name });
-  if (out !== null) { await refreshBranches(); if (!$("pane-history").classList.contains("hidden")) loadHistory(); }
+  if (!confirm(`Delete branch "${name}" (archive it)? Lore has no undo for this.`)) return;
+  try {
+    await invoke<string>("lore_branch_archive", { repo: repoPath, name });
+    showToast(`Archived "${name}"`);
+  } catch (e) {
+    // Lore returns "[Error] ... not found" when the branch is already gone from
+    // its view (e.g. a stale nav entry left over after another client removed it).
+    // That is not a real failure for the user - the branch is no longer there - so
+    // drop it quietly with a toast instead of a scary error dialog. Any other
+    // error is genuine and still surfaced.
+    if (/not found/i.test(String(e))) showToast(`Branch "${name}" was already gone`);
+    else alert(String(e));
+  }
+  // Refresh either way so the nav reflects Lore's real branch list, success or not.
+  await refreshBranches();
+  if (!$("pane-history").classList.contains("hidden")) loadHistory();
 }
 function openMergeFor(name: string) {
   openMergeModal();
@@ -1074,6 +1386,7 @@ function showTextDetail(title: string, sub: string, text: string) {
 // ---- File ops (right-click a changed file) ----
 function fileMenu(path: string): CtxItem[] {
   return [
+    { label: "Reveal in Explorer", run: () => revealInExplorer(path) },
     { label: "Lock file", run: () => lockFile(path, true) },
     { label: "Unlock file", run: () => lockFile(path, false) },
     { label: "Lock status", run: () => lockStatus(path) },
@@ -1081,6 +1394,11 @@ function fileMenu(path: string): CtxItem[] {
     { label: "Discard changes", danger: true, run: () => discardFiles([path]) },
     { label: "Copy path", run: () => navigator.clipboard?.writeText(path) },
   ];
+}
+// Open the OS file browser with the file selected, or the repo folder if no path.
+async function revealInExplorer(path = "") {
+  closeAllPopovers();
+  await invoke("reveal_in_explorer", { repo: repoPath, path }).catch((e) => alert(String(e)));
 }
 async function lockFile(path: string, lock: boolean) {
   const out = await call<string>(lock ? "lore_lock_acquire" : "lore_lock_release", { repo: repoPath, path });
@@ -1219,20 +1537,19 @@ function sbsCell(val: string | number | undefined, cls: string): HTMLElement {
 }
 
 // ---- Left nav (Changes / History) ----
+// Both panes are shown side by side now, so the nav buttons no longer switch -
+// they just refresh and scroll to the side you clicked.
 function selectNav(name: "changes" | "history") {
-  const ch = name === "changes";
-  $("pane-changes").classList.toggle("hidden", !ch);
-  $("pane-history").classList.toggle("hidden", ch);
-  $("nav-changes").classList.toggle("active", ch);
-  $("nav-history").classList.toggle("active", !ch);
-  clearDetail();
-  if (ch) refreshStatus();
-  else loadHistory();
+  $("nav-changes").classList.add("active");
+  $("nav-history").classList.add("active");
+  if (name === "changes") { refreshStatus(); $("pane-changes").scrollIntoView({ block: "nearest", inline: "start" }); }
+  else { loadHistory(); $("pane-history").scrollIntoView({ block: "nearest", inline: "end" }); }
 }
 
 // Re-scan when the user comes back to the window (e.g. after editing files).
 function refreshOnFocus() {
   if (!repoPath || $("app").classList.contains("hidden")) return;
+  refreshBranches(); // keep the branch nav truthful if branches changed via the CLI
   if (!$("pane-history").classList.contains("hidden")) loadHistory();
   else refreshStatus();
 }
@@ -1242,8 +1559,10 @@ function refreshOnFocus() {
 function setupSplitter() {
   const splitter = $("side-splitter");
   const side = document.querySelector(".gh-side") as HTMLElement;
+  // Two columns (Changes + History) need room, so never start narrower than 440
+  // even if an older single-column width was saved.
   const saved = localStorage.getItem("sideWidth");
-  if (saved) side.style.width = saved + "px";
+  if (saved) side.style.width = Math.max(440, Number(saved) || 0) + "px";
   let dragging = false;
   splitter.addEventListener("mousedown", (e) => {
     dragging = true;
@@ -1255,7 +1574,7 @@ function setupSplitter() {
   document.addEventListener("mousemove", (e) => {
     if (!dragging) return;
     const left = side.getBoundingClientRect().left;
-    const w = Math.max(220, Math.min(760, e.clientX - left));
+    const w = Math.max(440, Math.min(1200, e.clientX - left));
     side.style.width = w + "px";
   });
   document.addEventListener("mouseup", () => {
@@ -1362,73 +1681,252 @@ function openMergeModal() {
 async function doMerge() {
   const source = ($("merge-source") as HTMLSelectElement).value;
   const msg = ($("merge-msg") as HTMLInputElement).value.trim();
-  if (!source) { alert("No other branch to merge from."); return; }
-  if (!msg) { alert("Write a short message for the merge."); return; }
+  if (!source) { showToast("No other branch to merge from."); return; }
+  if (source === ($("branch-name").textContent || "").trim()) { showToast("Pick another branch - that's the current one."); return; }
+  if (!msg) { showToast("Write a short message for the merge."); return; }
   $("merge-overlay").classList.add("hidden");
-  const out = await call<string>("lore_merge_branch", { repo: repoPath, source, message: msg });
-  if (out === null) return;
+  mergeMessage = msg;
+  // "branch merge start" pauses on conflicts (writes diff3 markers into the files
+  // and lists them under "Changes in conflict:" in status) and auto-commits when
+  // the merge is clean.
+  const start = await tryInvoke("lore_merge_start", { repo: repoPath, source, message: msg });
   clearDetail();
   await refreshAll();
-  // Conflicts left behind? Open the resolve panel.
-  if ((lastStatus?.conflicts.length ?? 0) > 0 || /conflict/i.test(out)) openResolve();
+  mergeConflicts = currentConflicts();
+  if (mergeConflicts.length > 0) { openResolve(); return; }
+  // No conflicts: a clean merge that start already committed, nothing to merge,
+  // or a real failure. Tell the user softly either way.
+  if (/nothing to merge|already up to date|up-to-date|0 merged, 0 conflicted|no merge/i.test(start.out))
+    showToast(`Nothing to merge from ${source}`);
+  else if (!start.ok)
+    showToast(`Merge failed: ${firstError(start.out)}`);
+  else {
+    showToast(`Merged ${source}`);
+    if (!$("pane-history").classList.contains("hidden")) loadHistory();
+  }
+}
+
+let toastTimer = 0;
+function showToast(msg: string) {
+  const t = $("toast");
+  t.textContent = msg;
+  t.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = window.setTimeout(() => t.classList.remove("show"), 2600);
+}
+// Invoke without the alert() that `call` throws up. The merge flow wants every
+// outcome (clean, nothing-to-merge, failed) to land as a smooth toast, not a popup.
+async function tryInvoke(cmd: string, args: Record<string, unknown>): Promise<{ ok: boolean; out: string }> {
+  try { return { ok: true, out: (await invoke<string>(cmd, args)) ?? "" }; }
+  catch (e) { return { ok: false, out: String(e) }; }
+}
+// Pull a short, human line out of lore's error text for a toast.
+function firstError(out: string): string {
+  const err = out.split("\n").map((s) => s.trim()).find((s) => s.startsWith("[Error]"));
+  const line = err ? err.replace(/^\[Error\]\s*/, "") : (out.trim().split("\n")[0] || "unknown error");
+  return line.slice(0, 120);
 }
 
 // ---- Merge conflict resolve ----
-function openResolve() {
-  renderResolve();
-  $("resolve-overlay").classList.remove("hidden");
+// A conflict is whatever `lore status` lists under "Changes in conflict:" - the
+// app already parses that into lastStatus.conflicts. Picking a side strips the
+// markers and stages that file; once none remain, a plain commit finalises the
+// merge (Lore has no separate "merge finish" step).
+let mergeConflicts: string[] = [];
+let mergeMessage = "";
+function currentConflicts(): string[] {
+  return (lastStatus?.conflicts ?? []).map((c) => c.path);
 }
+function openResolve() { renderResolve(); $("resolve-overlay").classList.remove("hidden"); }
+// Cap rendered rows so a merge with thousands of conflicts cannot freeze the UI.
+// The bulk buttons still act on every file, not just the visible ones.
+const RESOLVE_RENDER_CAP = 400;
 function renderResolve() {
   const list = $("resolve-list");
   list.innerHTML = "";
-  const conflicts = lastStatus?.conflicts ?? [];
-  if (conflicts.length === 0) {
-    list.innerHTML = `<div class="muted small">No conflicted files detected. If Lore still reports a merge in progress, use Finish or Abort.</div>`;
+  const head = document.getElementById("resolve-count");
+  if (head) head.textContent = mergeConflicts.length === 0
+    ? "No conflicts left"
+    : `${mergeConflicts.length} file${mergeConflicts.length === 1 ? "" : "s"} in conflict`;
+  if (mergeConflicts.length === 0) {
+    list.innerHTML = `<div class="muted small">No conflicted files left - click Finish merge.</div>`;
     return;
   }
-  for (const c of conflicts) {
+  for (const path of mergeConflicts.slice(0, RESOLVE_RENDER_CAP)) {
     const row = document.createElement("div");
     row.className = "resolve-row";
     const nm = document.createElement("span");
-    nm.className = "resolve-name"; nm.textContent = c.path; nm.title = c.path;
+    nm.className = "resolve-name link"; nm.textContent = path; nm.title = "View the conflict";
+    nm.addEventListener("click", () => showConflictFile(path));
     const mine = document.createElement("button");
     mine.className = "ghost small"; mine.textContent = "Use mine";
-    mine.addEventListener("click", () => resolveSide("mine", c.path));
+    mine.addEventListener("click", () => resolveSide("mine", path));
     const theirs = document.createElement("button");
     theirs.className = "ghost small"; theirs.textContent = "Use theirs";
-    theirs.addEventListener("click", () => resolveSide("theirs", c.path));
+    theirs.addEventListener("click", () => resolveSide("theirs", path));
     const acts = document.createElement("div");
     acts.className = "resolve-acts"; acts.append(mine, theirs);
     row.append(nm, acts);
     list.appendChild(row);
   }
-}
-async function resolveSide(side: "mine" | "theirs", path?: string) {
-  const paths = path ? [path] : [];
-  const out = await call<string>("lore_merge_resolve", { repo: repoPath, side, paths });
-  if (out === null) return;
-  await refreshStatus();
-  renderResolve();
-}
-async function finishMerge() {
-  const out = await call<string>("lore_merge_finish", { repo: repoPath });
-  if (out === null) return;
-  if (/conflict/i.test(out)) {
-    alert("Still conflicts to resolve:\n\n" + out.trim());
-    await refreshStatus(); renderResolve(); return;
+  if (mergeConflicts.length > RESOLVE_RENDER_CAP) {
+    const more = document.createElement("div");
+    more.className = "muted small"; more.style.padding = "0.4rem 0.75rem";
+    more.textContent = `+ ${mergeConflicts.length - RESOLVE_RENDER_CAP} more - use the bulk buttons, or resolve in batches.`;
+    list.appendChild(more);
   }
+}
+// Pick a side for one file, or (no path) every conflicted file at once.
+async function resolveSide(side: "mine" | "theirs", path?: string) {
+  const paths = path ? [path] : mergeConflicts.slice();
+  if (paths.length === 0) return;
+  const res = await tryInvoke("lore_merge_resolve", { repo: repoPath, side, paths });
+  if (!res.ok) showToast(`Could not pick ${side}: ${firstError(res.out)}`);
+  await refreshAll();
+  mergeConflicts = currentConflicts();
+  if (mergeConflicts.length > 0) { renderResolve(); return; }
+  await finalizeMerge();
+}
+// No conflicts left - commit the staged merge to complete it.
+async function finalizeMerge() {
+  const res = await tryInvoke("lore_commit", { repo: repoPath, message: mergeMessage || "Merge" });
   $("resolve-overlay").classList.add("hidden");
+  mergeConflicts = [];
   clearDetail();
   await refreshAll();
   if (!$("pane-history").classList.contains("hidden")) loadHistory();
+  showToast(res.ok ? "Merge completed" : `Could not finish merge: ${firstError(res.out)}`);
+}
+async function finishMerge() {
+  await refreshAll();
+  mergeConflicts = currentConflicts();
+  if (mergeConflicts.length > 0) { renderResolve(); showToast("Resolve the remaining files first."); return; }
+  await finalizeMerge();
 }
 async function abortMerge() {
   if (!confirm("Abort the merge and discard the in-progress merge state?")) return;
-  const out = await call<string>("lore_merge_abort", { repo: repoPath });
-  if (out === null) return;
+  const res = await tryInvoke("lore_merge_abort", { repo: repoPath });
+  mergeConflicts = [];
   $("resolve-overlay").classList.add("hidden");
   clearDetail();
   await refreshAll();
+  showToast(res.ok ? "Merge aborted" : `Abort failed: ${firstError(res.out)}`);
+}
+// Show a conflicted file as a side-by-side comparison: left is yours (mine),
+// right is the incoming change (theirs), parsed from Lore's <<<< ==== >>>>
+// markers. A bar on top lets the user pick a side without going back to the list.
+async function showConflictFile(path: string) {
+  $("resolve-overlay").classList.add("hidden");
+  showDetail(baseName(path), "Conflict - left is yours (mine), right is incoming (theirs)");
+  $("detail-files").classList.add("hidden");
+  showDiffView();
+  $("diff-toolbar").classList.add("hidden");
+  const out = $("detail-diff") as HTMLElement;
+  try {
+    const buf = await invoke<ArrayBuffer>("read_file_bytes", { repo: repoPath, path });
+    const bytes = new Uint8Array(buf);
+    out.classList.remove("split");
+    out.innerHTML = "";
+    out.appendChild(conflictActionBar(path));
+    // Binary art (.fbx, textures, ...) cannot be merged or shown as text - the
+    // user simply picks which whole file wins.
+    if (looksBinary(bytes)) {
+      const m = document.createElement("div");
+      m.className = "muted small"; m.style.padding = "1rem";
+      m.textContent = "Binary file - no text comparison. Use 'Use mine' or 'Use theirs' above to keep one side.";
+      out.appendChild(m);
+      return;
+    }
+    const text = new TextDecoder().decode(bytes);
+    if (/^<{4,}/m.test(text)) {
+      out.classList.add("split");
+      out.appendChild(buildConflictGrid(text));
+      return;
+    }
+    // No markers left (already resolved) - just show the file plainly.
+    for (const line of text.split("\n")) {
+      const span = document.createElement("span");
+      span.className = "dl dl-ctx"; span.textContent = line + "\n";
+      out.appendChild(span);
+    }
+  } catch (e) { out.textContent = String(e); }
+}
+// Top bar over a conflict view: which side is which, plus quick side-pick.
+function conflictActionBar(path: string): HTMLElement {
+  const bar = document.createElement("div");
+  bar.className = "conflict-bar";
+  const label = document.createElement("span");
+  label.className = "muted small";
+  label.textContent = "◀ mine (yours)     theirs (incoming) ▶";
+  const mine = document.createElement("button");
+  mine.className = "ghost small"; mine.textContent = "Use mine";
+  mine.addEventListener("click", () => resolveSide("mine", path));
+  const theirs = document.createElement("button");
+  theirs.className = "ghost small"; theirs.textContent = "Use theirs";
+  theirs.addEventListener("click", () => resolveSide("theirs", path));
+  const back = document.createElement("button");
+  back.className = "ghost small"; back.textContent = "Back to list";
+  back.addEventListener("click", () => openResolve());
+  const acts = document.createElement("div");
+  acts.className = "resolve-acts"; acts.append(mine, theirs, back);
+  bar.append(label, acts);
+  return bar;
+}
+// A byte is NUL only in binary files - a cheap, reliable text/binary test.
+function looksBinary(bytes: Uint8Array): boolean {
+  const n = Math.min(bytes.length, 8000);
+  for (let i = 0; i < n; i++) if (bytes[i] === 0) return true;
+  return false;
+}
+type ConflictRow = { meta?: string; left?: string; right?: string; conflict?: boolean };
+// Split file text into context lines (same both sides) and conflict blocks
+// (mine on the left, theirs on the right), ignoring any ||||||| base section.
+function parseConflictHunks(text: string): ConflictRow[] {
+  const rows: ConflictRow[] = [];
+  const lines = text.split("\n");
+  let i = 0;
+  while (i < lines.length) {
+    if (/^<{4,}/.test(lines[i])) {
+      const mineLabel = lines[i].replace(/^<+\s?/, "").trim();
+      const mine: string[] = [];
+      const theirs: string[] = [];
+      i++;
+      while (i < lines.length && !/^={4,}/.test(lines[i]) && !/^\|{4,}/.test(lines[i])) { mine.push(lines[i]); i++; }
+      if (i < lines.length && /^\|{4,}/.test(lines[i])) { i++; while (i < lines.length && !/^={4,}/.test(lines[i])) i++; }
+      if (i < lines.length && /^={4,}/.test(lines[i])) i++;
+      while (i < lines.length && !/^>{4,}/.test(lines[i])) { theirs.push(lines[i]); i++; }
+      let theirsLabel = "";
+      if (i < lines.length && /^>{4,}/.test(lines[i])) { theirsLabel = lines[i].replace(/^>+\s?/, "").trim(); i++; }
+      rows.push({ meta: `conflict   mine${mineLabel ? " (" + mineLabel + ")" : ""}   |   theirs${theirsLabel ? " (" + theirsLabel + ")" : ""}` });
+      const n = Math.max(mine.length, theirs.length);
+      for (let k = 0; k < n; k++) rows.push({ left: mine[k], right: theirs[k], conflict: true });
+      continue;
+    }
+    rows.push({ left: lines[i], right: lines[i] });
+    i++;
+  }
+  return rows;
+}
+function buildConflictGrid(text: string): HTMLElement {
+  const grid = document.createElement("div");
+  grid.className = "diff-split";
+  for (const r of parseConflictHunks(text)) {
+    if (r.meta !== undefined) {
+      const m = document.createElement("div");
+      m.className = "dmeta"; m.textContent = r.meta;
+      grid.appendChild(m);
+      continue;
+    }
+    const leftCls = r.conflict ? "dl-del" : "dl-ctx";
+    const rightCls = r.conflict ? "dl-add" : "dl-ctx";
+    grid.append(
+      sbsCell("", "dn"),
+      sbsCell(r.left, "dc " + leftCls),
+      sbsCell("", "dn"),
+      sbsCell(r.right, "dc " + rightCls),
+    );
+  }
+  return grid;
 }
 
 // ---- Settings (global lore flags) ----
@@ -1469,6 +1967,11 @@ function getServerAddr(): string {
 function isLocalAddr(a: string): boolean {
   return a.includes("127.0.0.1") || a.includes("localhost");
 }
+// Persistent loreserver config dir (empty = temp/ephemeral storage).
+function getServerConfigDir(): string {
+  const saved = JSON.parse(localStorage.getItem(SET_KEY) || "{}");
+  return ((saved.serverConfigDir as string) || "").trim();
+}
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 // ---- Server control ----
@@ -1504,12 +2007,12 @@ async function ensureServer() {
   const addr = getServerAddr();
   if (await refreshServerStatus()) return;
   if (!isLocalAddr(addr)) return; // remote: connect-only, do not start
-  try { await invoke("lore_start_server"); } catch (e) { console.error(e); return; }
+  try { await invoke("lore_start_server", { configDir: getServerConfigDir() }); } catch (e) { console.error(e); return; }
   for (let i = 0; i < 15; i++) { await sleep(1000); if (await refreshServerStatus()) break; }
 }
 async function startServerClicked() {
   closeAllPopovers();
-  await invoke("lore_start_server").catch((e) => alert(String(e)));
+  await invoke("lore_start_server", { configDir: getServerConfigDir() }).catch((e) => alert(String(e)));
   for (let i = 0; i < 15; i++) { await sleep(1000); if (await refreshServerStatus()) break; }
 }
 async function stopServerClicked() {
@@ -1532,18 +2035,25 @@ function setSetupMode(mode: "host" | "connect") {
     c.classList.toggle("selected", r.checked);
   });
 }
-// Build the shareable address from this PC's LAN IP (fetched once) + the port.
+// Build the shareable address. A remote friend reaches you over Tailscale, so
+// prefer the 100.x tailnet address when present; fall back to the LAN IP.
 async function refreshSetupShare() {
   const port = ($("setup-port") as HTMLInputElement).value.trim() || "41337";
+  if (setupTsIp === undefined) {
+    try { setupTsIp = await invoke<string | null>("tailscale_ip"); } catch { setupTsIp = null; }
+  }
   if (setupLanIp === undefined) {
     try { setupLanIp = await invoke<string | null>("local_ip"); } catch { setupLanIp = null; }
   }
-  if (setupLanIp) {
-    $("setup-share-url").textContent = `lore://${setupLanIp}:${port}`;
-    $("setup-host-note").textContent = "loreserver listens on all interfaces by default, so teammates on your LAN or VPN can reach this once your firewall allows port 41337 (TCP+UDP). On Tailscale, share your 100.x address. Note: the quick local server stores data in a temp folder - run loreserver with a --config for a persistent team server.";
+  const ip = setupTsIp || setupLanIp;
+  if (ip) {
+    $("setup-share-url").textContent = `lore://${ip}:${port}`;
+    $("setup-host-note").textContent = setupTsIp
+      ? `Tailscale address detected. Share this URL with your friend on the same tailnet (their firewall and yours must allow port ${port} TCP+UDP - QUIC uses UDP). IMPORTANT: for the repo to stay available across restarts, start the server below with a persistent data folder, not the temp quick-start.`
+      : `loreserver listens on all interfaces, so teammates on your LAN or VPN can reach this once your firewall allows port ${port} (TCP+UDP). On Tailscale, share your 100.x address. The quick local server uses a TEMP folder - set a persistent data folder for a team server.`;
   } else {
     $("setup-share-url").textContent = `lore://127.0.0.1:${port}`;
-    $("setup-host-note").textContent = "No LAN address found - others can only reach you over a shared LAN or VPN (e.g. Tailscale).";
+    $("setup-host-note").textContent = "No shareable address found - others can only reach you over a shared LAN or VPN (e.g. Tailscale).";
   }
 }
 async function refreshSetupServerState() {
@@ -1561,7 +2071,7 @@ async function toggleSetupServer() {
   toggle.disabled = true;
   try {
     if (wasUp) await invoke("lore_stop_server");
-    else await invoke("lore_start_server");
+    else await invoke("lore_start_server", { configDir: getServerConfigDir() });
   } catch (e) { alert(String(e)); }
   for (let i = 0; i < 8; i++) {
     await sleep(800);
@@ -1586,6 +2096,7 @@ function openSetup() {
   const local = isLocalAddr(addr);
   ($("setup-port") as HTMLInputElement).value = portOf(addr) || "41337";
   ($("setup-addr") as HTMLInputElement).value = local ? "" : addr;
+  ($("setup-store") as HTMLInputElement).value = (JSON.parse(localStorage.getItem(SET_KEY) || "{}").serverStore as string) || "";
   $("setup-test-state").textContent = "";
   setSetupMode(local ? "host" : "connect");
   refreshSetupShare();
@@ -1595,15 +2106,24 @@ function openSetup() {
 async function saveSetup() {
   const mode = (document.querySelector('input[name="setupmode"]:checked') as HTMLInputElement)?.value || "host";
   let addr: string;
+  const saved = JSON.parse(localStorage.getItem(SET_KEY) || "{}");
   if (mode === "host") {
     const port = ($("setup-port") as HTMLInputElement).value.trim() || "41337";
     // The app drives a local server over loopback; the LAN address is only for sharing.
     addr = `lore://127.0.0.1:${port}`;
+    // Optional persistent data folder -> write a loreserver config dir for it.
+    const store = ($("setup-store") as HTMLInputElement).value.trim();
+    saved.serverStore = store;
+    if (store) {
+      try { saved.serverConfigDir = await invoke<string>("write_server_store_config", { dataDir: store }); }
+      catch (e) { alert(String(e)); return; }
+    } else {
+      saved.serverConfigDir = "";
+    }
   } else {
     addr = ($("setup-addr") as HTMLInputElement).value.trim();
     if (!addr) { alert("Type the server address to connect to."); return; }
   }
-  const saved = JSON.parse(localStorage.getItem(SET_KEY) || "{}");
   saved.serveraddr = addr;
   localStorage.setItem(SET_KEY, JSON.stringify(saved));
   ($("set-serveraddr") as HTMLInputElement).value = addr;
@@ -1634,6 +2154,8 @@ function openSettings() {
   ($("set-repoidentity") as HTMLInputElement).disabled = !repoPath;
   ($("set-ghuser") as HTMLInputElement).value = repoGithubUser;
   ($("set-ghuser") as HTMLInputElement).disabled = !repoPath;
+  ($("set-authorname") as HTMLInputElement).value = repoAuthorName;
+  ($("set-authorname") as HTMLInputElement).disabled = !repoPath;
   updateSettingsPreview();
   $("settings-overlay").classList.remove("hidden");
 }
@@ -1649,6 +2171,13 @@ async function saveSettings() {
       else localStorage.removeItem(ghUserKey(repoPath));
       avatarChanged = true;
     }
+    const newName = ($("set-authorname") as HTMLInputElement).value.trim();
+    if (newName !== repoAuthorName) {
+      repoAuthorName = newName;
+      if (newName) localStorage.setItem(authorNameKey(repoPath), newName);
+      else localStorage.removeItem(authorNameKey(repoPath));
+      avatarChanged = true; // reuse the history re-render path
+    }
     const newId = ($("set-repoidentity") as HTMLInputElement).value.trim();
     if (newId !== repoIdentity) {
       const out = await invoke<string>("lore_set_identity", { repo: repoPath, identity: newId }).catch((e) => { alert(String(e)); return null; });
@@ -1656,6 +2185,7 @@ async function saveSettings() {
     }
     if (avatarChanged) {
       avatarUrl = null;
+      avatarReadyUrl = null;
       if (!$("pane-history").classList.contains("hidden")) loadHistory();
     }
   }
@@ -1675,10 +2205,18 @@ window.addEventListener("DOMContentLoaded", () => {
   $("open-btn-2").addEventListener("click", openProject);
   $("create-btn").addEventListener("click", createProject);
   $("create-btn-2").addEventListener("click", createProject);
+  $("clone-btn").addEventListener("click", cloneProject);
+  $("clone-btn-2").addEventListener("click", cloneProject);
+  $("reveal-repo-btn").addEventListener("click", () => revealInExplorer(""));
 
   $("proj-btn").addEventListener("click", (e) => { e.stopPropagation(); renderRecent(); openPopover($("proj-menu"), $("proj-btn")); });
+  $("proj-btn").addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    if (repoPath) openContextMenu(e.clientX, e.clientY, [{ label: "Reveal repo in Explorer", run: () => revealInExplorer("") }]);
+  });
   $("branch-btn").addEventListener("click", (e) => { e.stopPropagation(); openPopover($("branch-menu"), $("branch-btn")); });
   $("sync-btn").addEventListener("click", syncAction);
+  $("push-btn").addEventListener("click", pushAction);
   $("newbranch-btn").addEventListener("click", newBranch);
   $("merge-open-btn").addEventListener("click", openMergeModal);
   $("merge-ok").addEventListener("click", doMerge);
@@ -1731,6 +2269,20 @@ window.addEventListener("DOMContentLoaded", () => {
   $("setup-copy").addEventListener("click", () => navigator.clipboard?.writeText($("setup-share-url").textContent || ""));
   $("setup-server-toggle").addEventListener("click", toggleSetupServer);
   $("setup-test").addEventListener("click", testSetupConnection);
+  $("setup-store-browse").addEventListener("click", async () => {
+    const picked = await open({ directory: true, title: "Pick a folder to keep server data" });
+    if (typeof picked === "string") ($("setup-store") as HTMLInputElement).value = picked;
+  });
+
+  // Branch-switch dirty guard.
+  $("switch-cancel").addEventListener("click", () => $("switch-overlay").classList.add("hidden"));
+  $("switch-bring").addEventListener("click", () => { $("switch-overlay").classList.add("hidden"); doSwitch(switchTargetName, false); });
+  $("switch-reset").addEventListener("click", () => {
+    if (!confirm(`Reset local changes to match "${switchTargetName}"? Your uncommitted edits will be lost.`)) return;
+    $("switch-overlay").classList.add("hidden");
+    doSwitch(switchTargetName, true);
+  });
+  $("switch-overlay").addEventListener("click", (e) => { if (e.target === $("switch-overlay")) $("switch-overlay").classList.add("hidden"); });
   $("setup-port").addEventListener("input", () => { refreshSetupShare(); refreshSetupServerState(); });
   document.querySelectorAll('input[name="setupmode"]').forEach((r) =>
     r.addEventListener("change", () => setSetupMode((r as HTMLInputElement).value as "host" | "connect"))

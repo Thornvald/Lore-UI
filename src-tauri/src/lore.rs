@@ -42,12 +42,17 @@ pub fn lore_server_status(base_url: String) -> bool {
 /// Start a local loreserver, detached and windowless, so it outlives the app
 /// and short tool runs. No-op if the app already started one.
 #[tauri::command(async)]
-pub fn lore_start_server() -> Result<String, String> {
+pub fn lore_start_server(config_dir: Option<String>) -> Result<String, String> {
     let mut guard = SERVER.lock().unwrap();
     if guard.is_some() {
         return Ok("Server already started by the app.".to_string());
     }
     let mut cmd = Command::new("loreserver");
+    // A persistent data folder keeps repos across restarts (else loreserver uses
+    // a temp dir). The folder must hold a local.toml (see write_server_store_config).
+    if let Some(dir) = config_dir.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+        cmd.args(["--config", dir]);
+    }
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     #[cfg(windows)]
     {
@@ -60,6 +65,28 @@ pub fn lore_start_server() -> Result<String, String> {
         .map_err(|e| format!("Could not start loreserver: {e}. Is it on your PATH?"))?;
     *guard = Some(child);
     Ok("Local server starting…".to_string())
+}
+
+/// Write a loreserver config dir under `data_dir` that points the immutable +
+/// mutable stores at a persistent folder, and return that config dir path (to
+/// pass to `lore_start_server`). This is how the quick local server keeps data.
+#[tauri::command(async)]
+pub fn write_server_store_config(data_dir: String) -> Result<String, String> {
+    let base = std::path::Path::new(&data_dir);
+    if data_dir.trim().is_empty() {
+        return Err("Pick a data folder first.".to_string());
+    }
+    let config_dir = base.join("lore-config");
+    let store_dir = base.join("store");
+    std::fs::create_dir_all(&config_dir).map_err(|e| format!("Could not create config folder: {e}"))?;
+    std::fs::create_dir_all(&store_dir).map_err(|e| format!("Could not create store folder: {e}"))?;
+    let store_path = store_dir.to_string_lossy().replace('\\', "/");
+    let toml = format!(
+        "[immutable_store.local]\npath = \"{store_path}\"\n\n[mutable_store.local]\npath = \"{store_path}\"\n"
+    );
+    std::fs::write(config_dir.join("local.toml"), toml)
+        .map_err(|e| format!("Could not write server config: {e}"))?;
+    Ok(config_dir.to_string_lossy().to_string())
 }
 
 /// Stop the local server the app started (does nothing to an external server).
@@ -128,10 +155,11 @@ pub struct BranchList {
     pub raw: String,
 }
 
-/// Run `lore <args>` inside `repo` and return combined stdout+stderr.
-/// Returns Err with the captured text if the binary fails to launch or the
-/// output contains a "[Error]" line.
-fn run_lore(repo: &str, args: &[&str]) -> Result<String, String> {
+/// Launch `lore <args>` inside `repo` and hand back whether the process exited
+/// cleanly plus its combined stdout+stderr. This is the low-level runner; pick
+/// the failure policy at the call site (strict text scan vs. trust the exit
+/// code) since the two disagree for commands that print benign "[Error]" noise.
+fn run_lore_raw(repo: &str, args: &[&str]) -> Result<(bool, String), String> {
     // Global flags from Settings go first, then the command's own args.
     let mut full = globals();
     // A GUI never wants the CLI to block on an interactive prompt (e.g. per-link
@@ -150,15 +178,59 @@ fn run_lore(repo: &str, args: &[&str]) -> Result<String, String> {
     let mut combined = String::new();
     combined.push_str(&String::from_utf8_lossy(&output.stdout));
     combined.push_str(&String::from_utf8_lossy(&output.stderr));
+    Ok((output.status.success(), combined))
+}
 
-    // lore's exit code is unreliable, so scan the text for an error marker.
+/// Run `lore <args>` inside `repo` and return combined stdout+stderr.
+/// Returns Err with the captured text if the binary fails to launch or the
+/// output contains a "[Error]" line. Most commands use this strict scan.
+fn run_lore(repo: &str, args: &[&str]) -> Result<String, String> {
+    let (success, combined) = run_lore_raw(repo, args)?;
+
+    // lore's exit code is unreliable for many commands, so scan the text for an
+    // error marker. Commands where the exit code IS reliable (e.g. archive) use
+    // run_lore_raw directly instead, so they are not tripped up by benign noise.
     if let Some(line) = combined.lines().find(|l| l.trim_start().starts_with("[Error]")) {
         return Err(line.trim().to_string());
     }
-    if !output.status.success() && combined.trim().is_empty() {
-        return Err(format!("lore exited with status {}", output.status));
+    if !success && combined.trim().is_empty() {
+        return Err("lore exited with an error (no output).".to_string());
     }
     Ok(combined)
+}
+
+/// Run a command and return the FULL combined output either way - the exit code
+/// alone decides Ok vs Err. Merge commands need this: a conflict prints one
+/// "[Error] ... <file>" line per clashing file, and run_lore's strict scan would
+/// throw away all but the first, hiding files from the resolve list.
+fn run_lore_full(repo: &str, args: &[&str]) -> Result<String, String> {
+    let (success, combined) = run_lore_raw(repo, args)?;
+    if success {
+        return Ok(combined);
+    }
+    Err(combined)
+}
+
+/// Lore prints file lines as "M path (M)" where the trailing "(M)" is a status
+/// annotation, not part of the name. Strip a short "(X)" suffix so it is never
+/// fed back as a path - lore rejects that with "Invalid path <name> (M)" and the
+/// change can never be committed.
+fn strip_status_suffix(path: &str) -> String {
+    // A conflicted file is shown as "M  file (M)!" - the trailing '!' flags that
+    // markers are present. Drop it first, then the "(X)" annotation.
+    let p = path.trim_end().trim_end_matches('!').trim_end();
+    if p.ends_with(')') {
+        if let Some(open) = p.rfind(" (") {
+            let inner = &p[open + 2..p.len() - 1];
+            if !inner.is_empty()
+                && inner.len() <= 3
+                && inner.chars().all(|c| c.is_ascii_alphabetic() || c == '?')
+            {
+                return p[..open].trim_end().to_string();
+            }
+        }
+    }
+    p.to_string()
 }
 
 /// Parse the output of `lore status --scan`.
@@ -249,9 +321,9 @@ fn parse_status(raw: String) -> StatusInfo {
                 let first = chars.next().unwrap();
                 let marked = matches!(chars.next(), Some(c) if c.is_whitespace());
                 let (status, path) = if marked {
-                    (first.to_string(), t[first.len_utf8()..].trim().to_string())
+                    (first.to_string(), strip_status_suffix(t[first.len_utf8()..].trim()))
                 } else {
-                    ("C".to_string(), t.to_string())
+                    ("C".to_string(), strip_status_suffix(t))
                 };
                 info.conflicts.push(FileChange { status, path });
             }
@@ -265,7 +337,7 @@ fn parse_status(raw: String) -> StatusInfo {
             && trimmed[1..2].chars().all(|c| c.is_whitespace());
         if section != Section::None && starts_with_marker {
             let status = trimmed[0..1].to_string();
-            let path = trimmed[1..].trim().to_string();
+            let path = strip_status_suffix(trimmed[1..].trim());
             let change = FileChange { status, path };
             match section {
                 Section::Staged => info.staged.push(change),
@@ -366,7 +438,11 @@ pub fn lore_branches(repo: String) -> Result<BranchList, String> {
 }
 
 #[tauri::command(async)]
-pub fn lore_switch_branch(repo: String, name: String) -> Result<String, String> {
+pub fn lore_switch_branch(repo: String, name: String, reset: bool) -> Result<String, String> {
+    // --reset overwrites local modified files to match the incoming revision.
+    if reset {
+        return run_lore(&repo, &["branch", "switch", &name, "--reset"]);
+    }
     run_lore(&repo, &["branch", "switch", &name])
 }
 
@@ -404,12 +480,16 @@ pub fn lore_merge_branch(repo: String, source: String, message: String) -> Resul
 }
 
 /// Start a merge that may leave conflicts for the user to resolve in the UI.
+/// `message` is used to commit when the merge is clean (no conflicts).
 #[tauri::command(async)]
-pub fn lore_merge_start(repo: String, source: String) -> Result<String, String> {
+pub fn lore_merge_start(repo: String, source: String, message: String) -> Result<String, String> {
     if source.trim().is_empty() {
         return Err("Pick a branch to merge from.".to_string());
     }
-    run_lore(&repo, &["branch", "merge", "start", &source])
+    if message.trim().is_empty() {
+        return run_lore_full(&repo, &["branch", "merge", "start", &source]);
+    }
+    run_lore_full(&repo, &["branch", "merge", "start", &source, "--message", &message])
 }
 
 /// Resolve conflicts using one side: `side` is "mine" or "theirs". With no
@@ -423,13 +503,13 @@ pub fn lore_merge_resolve(repo: String, side: String, paths: Vec<String>) -> Res
     for p in &paths {
         args.push(p.as_str());
     }
-    run_lore(&repo, &args)
+    run_lore_full(&repo, &args)
 }
 
 /// Finalize the merge once all conflicts are resolved.
 #[tauri::command(async)]
 pub fn lore_merge_finish(repo: String) -> Result<String, String> {
-    run_lore(&repo, &["branch", "merge", "resolve"])
+    run_lore_full(&repo, &["branch", "merge", "resolve"])
 }
 
 /// Abort an in-progress merge.
@@ -453,7 +533,117 @@ pub fn lore_create_repo(path: String, url: String) -> Result<String, String> {
     if dir.join(".lore").is_dir() {
         return Err("That folder is already a Lore project.".to_string());
     }
-    run_lore(&path, &["repository", "create", url.trim()])
+    let out = run_lore(&path, &["repository", "create", url.trim()])?;
+    // Set the new repo up for Unreal before the first scan/commit ever runs.
+    apply_unreal_setup(dir);
+    Ok(out)
+}
+
+/// When the folder is an Unreal project, make it usable for Unreal: raise the
+/// tiny default local store cap (so large file fragments are not evicted before
+/// they can be pushed - the documented cause of "Missing fragments"), and drop in
+/// a `.loreignore` so the huge derived folders are never scanned/staged/committed.
+/// Idempotent and Unreal-only: does nothing for a non-Unreal folder, never
+/// clobbers an existing `.loreignore`, and only bumps the store cap if it is
+/// still the default. Returns true if it just created the `.loreignore`.
+fn apply_unreal_setup(dir: &std::path::Path) -> bool {
+    if !has_uproject(dir) {
+        return false;
+    }
+    raise_store_capacity(&dir.join(".lore").join("config.toml"));
+    let ignore = dir.join(".loreignore");
+    let added = !ignore.exists();
+    write_unreal_loreignore(&ignore);
+    added
+}
+
+/// Ensure an already-existing Unreal project is set up (called when a project is
+/// opened, not just created). Returns true if a `.loreignore` was just added, so
+/// the UI can mention it.
+#[tauri::command(async)]
+pub fn ensure_unreal_setup(repo: String) -> Result<bool, String> {
+    Ok(apply_unreal_setup(std::path::Path::new(&repo)))
+}
+
+/// True if the folder holds an Unreal project file (`*.uproject`).
+fn has_uproject(dir: &std::path::Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else { return false };
+    entries.flatten().any(|e| {
+        e.path()
+            .extension()
+            .and_then(|x| x.to_str())
+            .is_some_and(|x| x.eq_ignore_ascii_case("uproject"))
+    })
+}
+
+/// Bump the local immutable store cap so big projects' fragments survive until
+/// push. Lore's default is only 10 MiB with a 10s eviction delay; we replace the
+/// known defaults with generous values. Best-effort - if the file looks
+/// different we leave it untouched rather than risk corrupting it.
+fn raise_store_capacity(config: &std::path::Path) {
+    let Ok(text) = std::fs::read_to_string(config) else { return };
+    // 8 GiB cap, 5 min eviction delay - comfortably covers an Unreal Content push.
+    let patched = text
+        .replace("max_capacity = 10485760", "max_capacity = 8589934592")
+        .replace("eviction_delay = 10", "eviction_delay = 300");
+    if patched != text {
+        let _ = std::fs::write(config, patched);
+    }
+}
+
+/// Write a `.loreignore` for an Unreal project. Uses std::fs::write so the file
+/// has NO byte-order mark - a BOM corrupts the first ignore line. Never clobbers
+/// a `.loreignore` the user already made.
+fn write_unreal_loreignore(path: &std::path::Path) {
+    if path.exists() {
+        return;
+    }
+    // Derived/transient Unreal folders - regenerated by the engine, never source.
+    let body = "# Unreal Engine - generated by lore-ui. These are regenerated by the\n\
+        # engine and must not be versioned. Source lives in Content/ Config/ Source/.\n\
+        Binaries/\n\
+        Build/\n\
+        DerivedDataCache/\n\
+        Intermediate/\n\
+        Saved/\n\
+        .vs/\n\
+        .idea/\n\
+        *.sln\n\
+        *.suo\n\
+        *.xcodeproj/\n\
+        *.xcworkspace/\n";
+    let _ = std::fs::write(path, body);
+}
+
+/// Clone an existing repository from any Lore server URL into a new subfolder of
+/// `parent`. The server can be anywhere reachable - localhost, a LAN box, a VPS,
+/// a Tailscale 100.x peer - it is just a `lore://host:port/name` URL. Returns the
+/// path of the cloned folder so the UI can open it.
+#[tauri::command(async)]
+pub fn lore_clone(url: String, parent: String) -> Result<String, String> {
+    if url.trim().is_empty() {
+        return Err("Type the repository URL, like lore://host:port/name".to_string());
+    }
+    let p = std::path::Path::new(&parent);
+    if !p.is_dir() {
+        return Err("Pick a folder to clone into.".to_string());
+    }
+    // Land the repo in a subfolder named after it (the last URL segment), so we
+    // never clone into a folder that already has contents.
+    let name = url
+        .trim()
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("cloned-repo");
+    let dest = p.join(name);
+    if dest.join(".lore").is_dir() {
+        return Err(format!("\"{name}\" is already cloned in this folder."));
+    }
+    run_lore(&parent, &["clone", url.trim(), &dest.to_string_lossy()])?;
+    // Hand back the cloned path so the caller can open it straight away.
+    Ok(dest.to_string_lossy().to_string())
 }
 
 /// One entry from `lore history`.
@@ -463,6 +653,9 @@ pub struct Commit {
     pub signature: String,
     /// Branch id this revision sits on (used to colour the history graph).
     pub branch: String,
+    /// For a merge commit, the signature of the merged-in revision (its second
+    /// parent), so the UI can draw the merge line.
+    pub merge_parent: String,
     pub date: String,
     pub message: String,
     pub is_merge: bool,
@@ -491,6 +684,7 @@ fn parse_history(raw: String) -> Vec<Commit> {
                 revision: value(t),
                 signature: String::new(),
                 branch: String::new(),
+                merge_parent: String::new(),
                 date: String::new(),
                 message: String::new(),
                 is_merge: false,
@@ -506,6 +700,7 @@ fn parse_history(raw: String) -> Vec<Commit> {
         } else if t.starts_with("Merge") {
             if let Some(c) = out.last_mut() {
                 c.is_merge = true;
+                c.merge_parent = value(t);
             }
         } else if t.starts_with("Date") {
             if let Some(c) = out.last_mut() {
@@ -523,6 +718,18 @@ fn parse_history(raw: String) -> Vec<Commit> {
 #[tauri::command(async)]
 pub fn lore_history(repo: String) -> Result<Vec<Commit>, String> {
     let raw = run_lore(&repo, &["history"])?;
+    Ok(parse_history(raw))
+}
+
+/// History starting at a specific revision and stopping at its branch point
+/// (`--only-branch`). Used to pull a merged-in branch's own commits so the
+/// history view can draw them as a separate lane joined at the merge commit.
+#[tauri::command(async)]
+pub fn lore_history_from(repo: String, revision: String) -> Result<Vec<Commit>, String> {
+    if revision.trim().is_empty() {
+        return Err("No revision given.".to_string());
+    }
+    let raw = run_lore(&repo, &["history", "--revision", &revision, "--only-branch"])?;
     Ok(parse_history(raw))
 }
 
@@ -687,7 +894,19 @@ pub fn lore_branch_archive(repo: String, name: String) -> Result<String, String>
     if name.trim().is_empty() {
         return Err("No branch given.".to_string());
     }
-    run_lore(&repo, &["branch", "archive", &name])
+    // Archive succeeds (exit 0) yet still prints a benign "[Error] Not found"
+    // when the branch was never pushed, so there is no remote copy to archive.
+    // The exit code is reliable here, so trust it rather than the text scan.
+    // A real failure (e.g. archiving the current branch) exits non-zero, and we
+    // surface its "[Error]" line.
+    let (success, out) = run_lore_raw(&repo, &["branch", "archive", &name])?;
+    if success {
+        return Ok(out);
+    }
+    if let Some(line) = out.lines().find(|l| l.trim_start().starts_with("[Error]")) {
+        return Err(line.trim().to_string());
+    }
+    Err("Could not archive the branch.".to_string())
 }
 
 /// Protect or unprotect a branch from direct pushes.
@@ -1162,17 +1381,60 @@ fn find_blender() -> std::path::PathBuf {
     PathBuf::from("blender") // last resort: rely on PATH
 }
 
+/// Where a `.blend`'s converted glb is cached on disk. Keyed by the file's full
+/// path + last-modified time, so an edited .blend re-converts but an unchanged
+/// one is served instantly across sessions.
+fn blend_cache_path(input: &std::path::Path) -> Option<std::path::PathBuf> {
+    use std::hash::{Hash, Hasher};
+    let meta = std::fs::metadata(input).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    input.to_string_lossy().hash(&mut hasher);
+    mtime.hash(&mut hasher);
+    meta.len().hash(&mut hasher);
+    let dir = std::env::temp_dir().join("loreui_blendcache");
+    let _ = std::fs::create_dir_all(&dir);
+    Some(dir.join(format!("{:016x}.glb", hasher.finish())))
+}
+
+/// True if this `.blend` already has a converted glb on disk (so the UI can show
+/// a row thumbnail without kicking off a slow conversion for every file).
+#[tauri::command(async)]
+pub fn blend_is_cached(repo: String, path: String) -> bool {
+    let input = std::path::Path::new(&repo).join(&path);
+    match blend_cache_path(&input) {
+        Some(p) => p.is_file(),
+        None => false,
+    }
+}
+
 /// Convert a `.blend` to glTF-binary (glb) with a headless Blender and return
-/// the glb bytes for the 3D viewer - so a `.blend` previews like an FBX. Needs
-/// Blender installed (found via `find_blender`).
+/// the glb bytes for the 3D viewer - so a `.blend` previews like an FBX. The
+/// result is cached on disk (see `blend_cache_path`), so the first view of a
+/// file is slow but every later view is instant. Needs Blender installed.
 #[tauri::command(async)]
 pub fn blend_to_glb(repo: String, path: String) -> Result<tauri::ipc::Response, String> {
     let input = std::path::Path::new(&repo).join(&path);
     if !input.is_file() {
         return Err("File not found.".to_string());
     }
-    let blender = find_blender();
 
+    // Serve the cached glb if we already converted this exact file.
+    let cache = blend_cache_path(&input);
+    if let Some(c) = &cache {
+        if c.is_file() {
+            if let Ok(bytes) = std::fs::read(c) {
+                return Ok(tauri::ipc::Response::new(bytes));
+            }
+        }
+    }
+
+    let blender = find_blender();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -1180,9 +1442,9 @@ pub fn blend_to_glb(repo: String, path: String) -> Result<tauri::ipc::Response, 
     let out = std::env::temp_dir().join(format!("loreui_blend_{nanos}.glb"));
     let out_py = out.to_string_lossy().replace('\\', "/");
 
-    // Load the .blend in background mode and export the scene to glb.
+    // Load the .blend in background mode and export the whole scene to glb.
     let script = format!(
-        "import bpy\ntry:\n import addon_utils; addon_utils.enable('io_scene_gltf2')\nexcept Exception:\n pass\nbpy.ops.export_scene.gltf(filepath='{out_py}', export_format='GLB')\n"
+        "import bpy\ntry:\n import addon_utils; addon_utils.enable('io_scene_gltf2')\nexcept Exception:\n pass\nbpy.ops.export_scene.gltf(filepath='{out_py}', export_format='GLB', use_visible=False, use_renderable=False)\n"
     );
 
     let mut cmd = Command::new(&blender);
@@ -1210,8 +1472,38 @@ pub fn blend_to_glb(repo: String, path: String) -> Result<tauri::ipc::Response, 
         ));
     }
     let bytes = std::fs::read(&out).map_err(|e| format!("Cannot read converted model: {e}"))?;
+    // Keep the result for next time, then clean up the temp export.
+    if let Some(c) = &cache {
+        let _ = std::fs::copy(&out, c);
+    }
     let _ = std::fs::remove_file(&out);
     Ok(tauri::ipc::Response::new(bytes))
+}
+
+/// Open the system file browser with `path` selected (or the repo folder when
+/// `path` is empty). Windows-only for now (Explorer).
+#[tauri::command(async)]
+pub fn reveal_in_explorer(repo: String, path: String) -> Result<(), String> {
+    let target = if path.trim().is_empty() {
+        std::path::PathBuf::from(&repo)
+    } else {
+        std::path::Path::new(&repo).join(&path)
+    };
+    #[cfg(windows)]
+    {
+        let mut cmd = Command::new("explorer");
+        if path.trim().is_empty() {
+            cmd.arg(&target);
+        } else {
+            // `/select,<path>` highlights the file inside its folder.
+            cmd.arg(format!("/select,{}", target.display()));
+        }
+        // explorer returns a non-zero code even on success, so just spawn it.
+        cmd.spawn().map_err(|e| format!("Could not open Explorer: {e}"))?;
+        return Ok(());
+    }
+    #[allow(unreachable_code)]
+    Err("Reveal in Explorer is only available on Windows.".to_string())
 }
 
 /// The repo's configured identity (e.g. an email) from `.lore/config.toml`, or
@@ -1293,6 +1585,26 @@ pub fn local_ip() -> Option<String> {
         return None;
     }
     Some(ip.to_string())
+}
+
+/// This machine's Tailscale address, if Tailscale is up. Connecting a UDP socket
+/// to Tailscale's MagicDNS IP (100.100.100.100) routes through the tailscale
+/// interface, so the socket's own address is the 100.x CGNAT address - exactly
+/// what a friend on the same tailnet uses to reach this server. Returns None when
+/// Tailscale is not running (the route to that IP then leaves the tailnet).
+#[tauri::command(async)]
+pub fn tailscale_ip() -> Option<String> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect("100.100.100.100:80").ok()?;
+    let ip = sock.local_addr().ok()?.ip();
+    if let std::net::IpAddr::V4(v4) = ip {
+        let o = v4.octets();
+        // Tailscale assigns out of 100.64.0.0/10 (CGNAT).
+        if o[0] == 100 && (64..=127).contains(&o[1]) {
+            return Some(ip.to_string());
+        }
+    }
+    None
 }
 
 #[cfg(test)]
