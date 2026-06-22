@@ -103,6 +103,20 @@ pub fn write_server_store_config(data_dir: String) -> Result<String, String> {
     Ok(config_dir.to_string_lossy().to_string())
 }
 
+/// A sensible default folder for the local server's PERSISTENT data, so the
+/// auto-started server never runs on temp storage (which silently loses every
+/// repo when it restarts). Created if missing.
+#[tauri::command(async)]
+pub fn default_server_data_dir() -> Result<String, String> {
+    let base = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .map_err(|_| "Could not find the user home folder.".to_string())?;
+    let dir = std::path::Path::new(&base).join("LoreServerData");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("Could not create the server data folder: {e}"))?;
+    Ok(dir.to_string_lossy().to_string())
+}
+
 /// Stop the local server the app started (does nothing to an external server).
 #[tauri::command(async)]
 pub fn lore_stop_server() -> Result<String, String> {

@@ -2005,15 +2005,32 @@ async function refreshServerStatus(): Promise<boolean> {
 // Start a local server if the address is local and nothing is answering.
 async function ensureServer() {
   const addr = getServerAddr();
-  if (await refreshServerStatus()) return;
+  if (await refreshServerStatus()) return; // already up (even one started earlier) - just use it
   if (!isLocalAddr(addr)) return; // remote: connect-only, do not start
-  try { await invoke("lore_start_server", { configDir: getServerConfigDir() }); } catch (e) { console.error(e); return; }
+  await startLocalServer();
+}
+// Start the local server, defaulting to a PERSISTENT data folder so it never
+// runs on temp storage (which loses every repo when it restarts).
+async function startLocalServer() {
+  let configDir = getServerConfigDir();
+  if (!configDir) {
+    try {
+      const dataDir = await invoke<string>("default_server_data_dir");
+      configDir = await invoke<string>("write_server_store_config", { dataDir });
+      setServerConfigDir(configDir); // remember it so future starts reuse the same store
+    } catch (e) { console.error(e); }
+  }
+  try { await invoke("lore_start_server", { configDir }); } catch (e) { console.error(e); return; }
   for (let i = 0; i < 15; i++) { await sleep(1000); if (await refreshServerStatus()) break; }
+}
+function setServerConfigDir(dir: string) {
+  const saved = JSON.parse(localStorage.getItem(SET_KEY) || "{}");
+  saved.serverConfigDir = dir;
+  localStorage.setItem(SET_KEY, JSON.stringify(saved));
 }
 async function startServerClicked() {
   closeAllPopovers();
-  await invoke("lore_start_server", { configDir: getServerConfigDir() }).catch((e) => alert(String(e)));
-  for (let i = 0; i < 15; i++) { await sleep(1000); if (await refreshServerStatus()) break; }
+  await startLocalServer();
 }
 async function stopServerClicked() {
   closeAllPopovers();

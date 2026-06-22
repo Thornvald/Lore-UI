@@ -34,6 +34,7 @@ pub fn run() {
             lore::lore_set_globals,
             lore::lore_server_status,
             lore::lore_start_server,
+            lore::default_server_data_dir,
             lore::lore_stop_server,
             lore::lore_is_repo,
             lore::file_meta,
