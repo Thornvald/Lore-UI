@@ -1,150 +1,0 @@
-
-> lore-ui@0.1.0 tauri
-> tauri dev
-
-     Running BeforeDevCommand (`npm run dev`)
-
-> lore-ui@0.1.0 dev
-> vite
-
-
-  [32m[1mVITE[22m v6.4.3[39m  [2mready in [0m[1m220[22m[2m[0m ms[22m
-
-  [32m➜[39m  [1mLocal[22m:   [36mhttp://localhost:[1m1420[22m/[39m
-     Running DevCommand (`cargo  run --no-default-features --color always --`)
-        Info Watching C:\Users\DevUser\lore-ui\src-tauri for changes...
-[1m[92m    Finished[0m `dev` profile [unoptimized + debuginfo] target(s) in 0.24s
-[1m[92m     Running[0m `target\debug\lore-ui.exe`
-[2m11:20:05 AM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2mindex.html[22m
-[2m11:20:19 AM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/styles.css?direct[22m
-[2m11:20:34 AM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2msrc/main.ts[22m
-[2m11:20:47 AM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2msrc/main.ts[22m
-[2m2:35:02 PM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2msrc/main.ts[22m
-[2m2:35:33 PM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2msrc/main.ts[22m
-[2m2:35:52 PM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/styles.css?direct[22m
-[2m2:36:32 PM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2msrc/main.ts[22m
-[2m2:40:51 PM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2msrc/main.ts[22m
-[2m2:53:33 PM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2msrc/main.ts[22m
-        Info File src-tauri\src\lore.rs.tmp.28492.678c36e79949 changed. Rebuilding application...
-     Running DevCommand (`cargo  run --no-default-features --color always --`)
-        Info File src-tauri\src\lore.rs changed. Rebuilding application...
-     Running DevCommand (`cargo  run --no-default-features --color always --`)
-        Info File src-tauri\src\lore.rs changed. Rebuilding application...
-     Running DevCommand (`cargo  run --no-default-features --color always --`)
-[1m[92m   Compiling[0m lore-ui v0.1.0 (C:\Users\DevUser\lore-ui\src-tauri)
-[1m[96m    Building[0m [=======================> ] 378/380: lore-ui [1m[96m    Building[0m [=======================> ] 379/380: lore-ui…                                                            [1m[92m    Finished[0m `dev` profile [unoptimized + debuginfo] target(s) in 14.81s
-[1m[92m     Running[0m `target\debug\lore-ui.exe`
-[2m4:06:12 PM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2msrc/main.ts[22m
-[2m4:06:26 PM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2msrc/main.ts[22m
-[2m4:06:37 PM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2msrc/main.ts[22m
-[2m4:06:47 PM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2msrc/main.ts[22m
-        Info File src-tauri\src\lore.rs changed. Rebuilding application...
-     Running DevCommand (`cargo  run --no-default-features --color always --`)
-[1m[92m   Compiling[0m lore-ui v0.1.0 (C:\Users\DevUser\lore-ui\src-tauri)
-[1m[96m    Building[0m [=======================> ] 378/380: lore-ui                                                             [1m[93mwarning[0m[1m[97m: function `strip_status_suffix` is never used[0m
-   [1m[96m--> [0msrc\lore.rs:206:4
-    [1m[96m|[0m
-[1m[96m206[0m [1m[96m|[0m fn strip_status_suffix(path: &str) -> String {
-    [1m[96m|[0m    [1m[93m^^^^^^^^^^^^^^^^^^^[0m
-    [1m[96m|[0m
-    [1m[96m= [0m[1m[97mnote[0m: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
-
-[1m[96m    Building[0m [=======================> ] 378/380: lore-ui                                                             [1m[93mwarning[0m: `lore-ui` (lib) generated 1 warning
-[1m[96m    Building[0m [=======================> ] 379/380: lore-ui…                                                            [1m[92m    Finished[0m `dev` profile [unoptimized + debuginfo] target(s) in 4.91s
-[1m[92m     Running[0m `target\debug\lore-ui.exe`
-        Info File src-tauri\src\lore.rs changed. Rebuilding application...
-     Running DevCommand (`cargo  run --no-default-features --color always --`)
-[1m[92m   Compiling[0m lore-ui v0.1.0 (C:\Users\DevUser\lore-ui\src-tauri)
-[1m[96m    Building[0m [=======================> ] 378/380: lore-ui [1m[96m    Building[0m [=======================> ] 379/380: lore-ui…                                                            [1m[92m    Finished[0m `dev` profile [unoptimized + debuginfo] target(s) in 4.36s
-[1m[92m     Running[0m `target\debug\lore-ui.exe`
-        Info File src-tauri\src\lore.rs changed. Rebuilding application...
-     Running DevCommand (`cargo  run --no-default-features --color always --`)
-[1m[92m   Compiling[0m lore-ui v0.1.0 (C:\Users\DevUser\lore-ui\src-tauri)
-[1m[96m    Building[0m [=======================> ] 378/380: lore-ui [1m[96m    Building[0m [=======================> ] 379/380: lore-ui…                                                            [1m[92m    Finished[0m `dev` profile [unoptimized + debuginfo] target(s) in 4.10s
-[1m[92m     Running[0m `target\debug\lore-ui.exe`
-[2m4:12:49 PM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2msrc/main.ts[22m
-[2m4:12:58 PM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2msrc/main.ts[22m
-[2m4:13:10 PM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2msrc/main.ts[22m
-[2m4:13:18 PM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2msrc/main.ts[22m
-[2m4:14:25 PM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2msrc/main.ts[22m
-[2m4:14:31 PM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2msrc/main.ts[22m
-[2m4:14:44 PM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2msrc/main.ts[22m
-[2m4:14:49 PM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2msrc/main.ts[22m
-[2m4:15:00 PM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2msrc/main.ts[22m
-[2m4:17:33 PM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/styles.css?direct[22m
-[2m4:17:38 PM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/styles.css?direct[22m
-[2m4:17:48 PM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/styles.css?direct[22m
-[2m4:17:59 PM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/styles.css?direct[22m
-[2m4:18:03 PM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2mindex.html[22m
-[2m4:18:16 PM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2msrc/main.ts[22m
-[2m4:18:29 PM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2mindex.html[22m
-[2m4:18:52 PM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2msrc/main.ts[22m
-[2m4:18:55 PM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2msrc/main.ts[22m
-[2m4:36:34 PM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2msrc/main.ts[22m
-[2m4:36:56 PM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/styles.css?direct[22m
-        Info File src-tauri\src\lore.rs changed. Rebuilding application...
-     Running DevCommand (`cargo  run --no-default-features --color always --`)
-[1m[92m   Compiling[0m lore-ui v0.1.0 (C:\Users\DevUser\lore-ui\src-tauri)
-[1m[96m    Building[0m [=======================> ] 378/380: lore-ui                                                             [1m[93mwarning[0m[1m[97m: function `run_lore_full` is never used[0m
-   [1m[96m--> [0msrc\lore.rs:206:4
-    [1m[96m|[0m
-[1m[96m206[0m [1m[96m|[0m fn run_lore_full(repo: &str, args: &[&str]) -> Result<String, String> {
-    [1m[96m|[0m    [1m[93m^^^^^^^^^^^^^[0m
-    [1m[96m|[0m
-    [1m[96m= [0m[1m[97mnote[0m: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
-
-[1m[96m    Building[0m [=======================> ] 378/380: lore-ui                                                             [1m[93mwarning[0m: `lore-ui` (lib) generated 1 warning
-[1m[96m    Building[0m [=======================> ] 379/380: lore-ui…                                                            [1m[92m    Finished[0m `dev` profile [unoptimized + debuginfo] target(s) in 5.07s
-[1m[92m     Running[0m `target\debug\lore-ui.exe`
-        Info File src-tauri\src\lore.rs changed. Rebuilding application...
-     Running DevCommand (`cargo  run --no-default-features --color always --`)
-[1m[92m   Compiling[0m lore-ui v0.1.0 (C:\Users\DevUser\lore-ui\src-tauri)
-[1m[96m    Building[0m [=======================> ] 378/380: lore-ui [1m[96m    Building[0m [=======================> ] 379/380: lore-ui…                                                            [1m[92m    Finished[0m `dev` profile [unoptimized + debuginfo] target(s) in 3.96s
-[1m[92m     Running[0m `target\debug\lore-ui.exe`
-        Info File src-tauri\src\lore.rs changed. Rebuilding application...
-     Running DevCommand (`cargo  run --no-default-features --color always --`)
-[1m[92m   Compiling[0m lore-ui v0.1.0 (C:\Users\DevUser\lore-ui\src-tauri)
-[1m[96m    Building[0m [=======================> ] 378/380: lore-ui [1m[96m    Building[0m [=======================> ] 379/380: lore-ui…                                                            [1m[92m    Finished[0m `dev` profile [unoptimized + debuginfo] target(s) in 4.02s
-[1m[92m     Running[0m `target\debug\lore-ui.exe`
-        Info File src-tauri\src\lore.rs changed. Rebuilding application...
-     Running DevCommand (`cargo  run --no-default-features --color always --`)
-[1m[92m   Compiling[0m lore-ui v0.1.0 (C:\Users\DevUser\lore-ui\src-tauri)
-[1m[96m    Building[0m [=======================> ] 378/380: lore-ui [1m[96m    Building[0m [=======================> ] 379/380: lore-ui…                                                            [1m[92m    Finished[0m `dev` profile [unoptimized + debuginfo] target(s) in 4.29s
-[1m[92m     Running[0m `target\debug\lore-ui.exe`
-[2m4:43:02 PM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2msrc/main.ts[22m
-[2m4:43:31 PM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2msrc/main.ts[22m
-        Info File src-tauri\src\lore.rs changed. Rebuilding application...
-     Running DevCommand (`cargo  run --no-default-features --color always --`)
-[1m[92m   Compiling[0m lore-ui v0.1.0 (C:\Users\DevUser\lore-ui\src-tauri)
-[1m[96m    Building[0m [=======================> ] 378/380: lore-ui [1m[96m    Building[0m [=======================> ] 379/380: lore-ui…                                                            [1m[92m    Finished[0m `dev` profile [unoptimized + debuginfo] target(s) in 5.16s
-[1m[92m     Running[0m `target\debug\lore-ui.exe`
-[2m4:43:57 PM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2mindex.html[22m
-        Info File src-tauri\src\lore.rs changed. Rebuilding application...
-     Running DevCommand (`cargo  run --no-default-features --color always --`)
-[1m[92m   Compiling[0m lore-ui v0.1.0 (C:\Users\DevUser\lore-ui\src-tauri)
-[1m[96m    Building[0m [=======================> ] 378/380: lore-ui                                                             [1m[93mwarning[0m[1m[97m: function `lore_history_from` is never used[0m
-   [1m[96m--> [0msrc\lore.rs:618:8
-    [1m[96m|[0m
-[1m[96m618[0m [1m[96m|[0m pub fn lore_history_from(repo: String, revision: String) -> Result<Vec<Commit>, String> {
-    [1m[96m|[0m        [1m[93m^^^^^^^^^^^^^^^^^[0m
-    [1m[96m|[0m
-    [1m[96m= [0m[1m[97mnote[0m: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
-
-[1m[96m    Building[0m [=======================> ] 378/380: lore-ui         Info File src-tauri\src\lib.rs changed. Rebuilding application...
-     Running DevCommand (`cargo  run --no-default-features --color always --`)
-[1m[92m   Compiling[0m lore-ui v0.1.0 (C:\Users\DevUser\lore-ui\src-tauri)
-[1m[96m    Building[0m [=======================> ] 378/380: lore-ui [1m[96m    Building[0m [=======================> ] 379/380: lore-ui…                                                            [1m[92m    Finished[0m `dev` profile [unoptimized + debuginfo] target(s) in 5.35s
-[1m[92m     Running[0m `target\debug\lore-ui.exe`
-[2m4:49:22 PM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2msrc/main.ts[22m
-[2m4:49:54 PM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2msrc/main.ts[22m
-[2m4:50:08 PM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2msrc/main.ts[22m
-[2m4:50:12 PM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2msrc/main.ts[22m
-[2m4:50:49 PM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2msrc/main.ts[22m
-[2m4:51:21 PM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/styles.css?direct[22m
-[2m4:52:19 PM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2msrc/main.ts[22m
-[2m1:21:30 AM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2msrc/main.ts[22m
-[2m1:21:37 AM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2msrc/main.ts[22m
-[2m1:21:53 AM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2msrc/main.ts[22m
-[2m1:22:14 AM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2msrc/main.ts[22m
-[2m1:23:08 AM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2msrc/main.ts[22m
-[2m1:23:43 AM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2msrc/main.ts[22m

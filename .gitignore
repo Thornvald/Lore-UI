@@ -12,6 +12,9 @@ dist
 dist-ssr
 *.local
 
+# Captured dev-server output - local noise, not source
+devlog.txt
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
