@@ -15,14 +15,28 @@ use std::sync::Mutex;
 /// A local loreserver the app started itself (so we can stop it again).
 static SERVER: Mutex<Option<Child>> = Mutex::new(None);
 
+/// Apply CREATE_NO_WINDOW so spawning a CLI process does not flash a console
+/// window on Windows. Without it the app's constant `lore` calls (status polling,
+/// history, branch list, ...) pop a cmd window each time. No-op off Windows.
+fn no_window(cmd: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    #[cfg(not(windows))]
+    let _ = cmd;
+}
+
 /// True if a lore server answers at `base_url` (e.g. "lore://127.0.0.1:41337").
 /// Uses a cheap `repository list` and looks for connection errors.
 #[tauri::command(async)]
 pub fn lore_server_status(base_url: String) -> bool {
-    let out = Command::new("lore")
-        .args(["repository", "list", &base_url, "--non-interactive"])
-        .stdin(Stdio::null())
-        .output();
+    let mut cmd = Command::new("lore");
+    cmd.args(["repository", "list", &base_url, "--non-interactive"])
+        .stdin(Stdio::null());
+    no_window(&mut cmd);
+    let out = cmd.output();
     match out {
         Ok(o) => {
             let s = format!(
@@ -168,10 +182,10 @@ fn run_lore_raw(repo: &str, args: &[&str]) -> Result<(bool, String), String> {
         full.push("--non-interactive".to_string());
     }
     full.extend(args.iter().map(|a| a.to_string()));
-    let output = Command::new("lore")
-        .args(&full)
-        .current_dir(repo)
-        .stdin(Stdio::null())
+    let mut cmd = Command::new("lore");
+    cmd.args(&full).current_dir(repo).stdin(Stdio::null());
+    no_window(&mut cmd);
+    let output = cmd
         .output()
         .map_err(|e| format!("Could not run lore: {e}. Is the lore CLI on your PATH?"))?;
 
@@ -987,6 +1001,7 @@ pub fn lore_run(repo: String, mut args: Vec<String>) -> Result<RunResult, String
     if !repo.trim().is_empty() {
         cmd.current_dir(&repo);
     }
+    no_window(&mut cmd);
 
     let output = cmd
         .output()
