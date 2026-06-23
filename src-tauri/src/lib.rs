@@ -48,6 +48,8 @@ pub fn run() {
             lore::write_server_store_config,
             lore::lore_identity,
             lore::lore_set_identity,
+            lore::lore_repo_remote,
+            lore::start_repo_watch,
             lore::local_ip,
             lore::tailscale_ip,
             lore::lore_revision_sync,

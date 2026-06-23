@@ -26,4 +26,6 @@ serde_json = "1"
 # Pure-Rust decompressors so compressed .blend files can be read (no C deps).
 flate2 = "1"
 ruzstd = "0.7"
+# Filesystem watcher so working-tree changes show without a manual Refresh.
+notify = "6"
 

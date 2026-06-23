@@ -28,6 +28,49 @@ fn no_window(cmd: &mut Command) {
     let _ = cmd;
 }
 
+/// The active working-tree watcher (one repo at a time). Kept alive here so it
+/// keeps firing; dropping it (when a new repo is watched) stops the old one.
+static WATCHER: Mutex<Option<notify::RecommendedWatcher>> = Mutex::new(None);
+
+/// Watch the open repo's working tree and emit a "repo-changed" event whenever a
+/// real file change happens, so the Changes list updates without a manual Refresh.
+/// Lore's own `.lore` store and the big regenerated folders (Unreal Saved/, etc.)
+/// are skipped so commits and engine churn do not spam refreshes.
+#[tauri::command]
+pub fn start_repo_watch(app: tauri::AppHandle, repo: String) -> Result<(), String> {
+    use notify::{EventKind, RecursiveMode, Watcher};
+    use tauri::Emitter;
+
+    const SKIP: &[&str] = &[
+        ".lore", ".git", "Saved", "Intermediate", "DerivedDataCache", "Binaries",
+        "Build", "node_modules", "target", ".vs",
+    ];
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        let Ok(event) = res else { return };
+        if !matches!(
+            event.kind,
+            EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+        ) {
+            return;
+        }
+        // Ignore Lore's internal store and regenerated folders.
+        let skip = event.paths.iter().any(|p| {
+            p.components()
+                .any(|c| SKIP.contains(&c.as_os_str().to_string_lossy().as_ref()))
+        });
+        if skip {
+            return;
+        }
+        let _ = app.emit("repo-changed", ());
+    })
+    .map_err(|e| format!("Could not start the file watcher: {e}"))?;
+    watcher
+        .watch(std::path::Path::new(&repo), RecursiveMode::Recursive)
+        .map_err(|e| format!("Could not watch the project folder: {e}"))?;
+    *WATCHER.lock().unwrap() = Some(watcher);
+    Ok(())
+}
+
 /// True if a lore server answers at `base_url` (e.g. "lore://127.0.0.1:41337").
 /// Uses a cheap `repository list` and looks for connection errors.
 #[tauri::command(async)]
@@ -687,6 +730,10 @@ pub struct Commit {
     pub date: String,
     pub message: String,
     pub is_merge: bool,
+    /// Committer identity (email) for THIS revision, when Lore exposes it. Empty
+    /// for commits whose author Lore did not retain (e.g. synced through an
+    /// auth-disabled server), so the UI can show "unknown" instead of faking it.
+    pub author: String,
 }
 
 fn parse_history(raw: String) -> Vec<Commit> {
@@ -716,6 +763,7 @@ fn parse_history(raw: String) -> Vec<Commit> {
                 date: String::new(),
                 message: String::new(),
                 is_merge: false,
+                author: String::new(),
             });
         } else if t.starts_with("Signature") {
             if let Some(c) = out.last_mut() {
@@ -733,6 +781,18 @@ fn parse_history(raw: String) -> Vec<Commit> {
         } else if t.starts_with("Date") {
             if let Some(c) = out.last_mut() {
                 c.date = value(t);
+            }
+        } else if t.starts_with("Committer") {
+            // Prefer Committer as the per-commit author when Lore exposes it.
+            if let Some(c) = out.last_mut() {
+                c.author = value(t);
+            }
+        } else if t.starts_with("Creator") {
+            // Fall back to Creator only if no Committer line was seen.
+            if let Some(c) = out.last_mut() {
+                if c.author.is_empty() {
+                    c.author = value(t);
+                }
             }
         }
         // Blank lines are ignored.
@@ -1548,6 +1608,27 @@ pub fn lore_identity(repo: String) -> String {
     for line in text.lines() {
         let t = line.trim();
         if let Some(rest) = t.strip_prefix("identity") {
+            if let Some(val) = rest.trim_start().strip_prefix('=') {
+                return val.trim().trim_matches('"').to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+/// The repo's remote server URL from `.lore/config.toml` (e.g.
+/// "lore://100.x.y.z:41337"), or "" if none. Lets the UI show whether the open
+/// project is on a Local server (localhost) or a Remote one.
+#[tauri::command(async)]
+pub fn lore_repo_remote(repo: String) -> String {
+    let cfg = std::path::Path::new(&repo).join(".lore").join("config.toml");
+    let text = match std::fs::read_to_string(&cfg) {
+        Ok(t) => t,
+        Err(_) => return String::new(),
+    };
+    for line in text.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("remote_url") {
             if let Some(val) = rest.trim_start().strip_prefix('=') {
                 return val.trim().trim_matches('"').to_string();
             }

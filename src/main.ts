@@ -1,6 +1,7 @@
 import "@fontsource-variable/geist";
 import "@fontsource-variable/geist-mono";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { mountPreview, previewKind, extOf, renderModelThumbnail } from "./preview";
 
@@ -29,6 +30,7 @@ interface Commit {
   date: string;
   message: string;
   is_merge: boolean;
+  author: string; // committer email for THIS commit, "" when Lore did not retain it
 }
 
 // One file row in the changes list, before it is folded into the folder tree.
@@ -96,12 +98,10 @@ let fileFilter = "";
 // The repo's configured identity (email or name), for author avatars. One per
 // repo - Lore records no per-commit author.
 let repoIdentity = "";
-// Cached avatar URL for the repo identity (GitHub or Gravatar), resolved once.
-let avatarUrl: string | null = null;
-// The avatar URL we have already confirmed loads. Once known, every avatar chip
-// applies it synchronously instead of re-probing - that stops the photo from
-// flashing back to initials each time the History view re-renders.
-let avatarReadyUrl: string | null = null;
+// The open repo's remote server URL + whether it is a remote (non-localhost)
+// server, so the top bar can read "Remote" for a cloned project, not "Local".
+let repoRemoteUrl = "";
+let repoIsRemote = false;
 // Optional GitHub username for this repo (UI-only, stored locally) - drives the
 // avatar PICTURE only.
 let repoGithubUser = "";
@@ -236,10 +236,10 @@ async function enterProject(path: string) {
   localStorage.setItem("repoPath", repoPath);
   addRecentProject(path);
   repoIdentity = await invoke<string>("lore_identity", { repo: path }).catch(() => "");
+  repoRemoteUrl = await invoke<string>("lore_repo_remote", { repo: path }).catch(() => "");
+  repoIsRemote = repoRemoteUrl !== "" && !isLocalAddr(repoRemoteUrl);
   repoGithubUser = localStorage.getItem(ghUserKey(path)) || "";
   repoAuthorName = localStorage.getItem(authorNameKey(path)) || "";
-  avatarUrl = null; // re-resolve the avatar for this repo's identity
-  avatarReadyUrl = null;
   $("proj-name").textContent = baseName(path);
   $("proj-path").textContent = path;
   $("empty").classList.add("hidden");
@@ -249,8 +249,20 @@ async function enterProject(path: string) {
   // the first scan below already skips the derived folders. Idempotent: it does
   // nothing on later opens, so we never reconfigure an already-set-up project.
   const unrealAdded = await invoke<boolean>("ensure_unreal_setup", { repo: path }).catch(() => false);
+  // Watch the working tree so changes show without a manual Refresh.
+  invoke("start_repo_watch", { repo: path }).catch(() => {});
   await refreshAll();
   if (unrealAdded) showToast("Unreal project - added .loreignore and raised the store size");
+}
+
+// Auto-refresh the Changes list when the watcher reports a working-tree change.
+// Debounced so a burst of file events triggers a single scan.
+let watchDebounce = 0;
+function startChangeWatcher() {
+  listen("repo-changed", () => {
+    clearTimeout(watchDebounce);
+    watchDebounce = window.setTimeout(() => { if (repoPath) refreshStatus(); }, 600);
+  });
 }
 
 function baseName(p: string): string {
@@ -547,11 +559,12 @@ function updatePushButton() {
 }
 
 function renderStatus(s: StatusInfo) {
-  // Get-latest is always available; Push shows only when there is something to send.
   const sync = (s.sync_state || "").toLowerCase();
   const behind = sync.includes("behind") || sync.includes("diverged");
-  // Get latest only ever reports the INCOMING side - being ahead is the Push
-  // button's job, so showing "ahead of remote" here read as a contradiction.
+  // Show Get latest ONLY when the remote actually has changes to pull. Showing it
+  // when up to date is error-prone (a pointless pull). Lore is centralized, so
+  // status reflects the real remote - "behind"/"diverged" means there is something.
+  $("sync-btn").classList.toggle("hidden", !behind);
   $("sync-sub").textContent = behind ? "remote has changes" : "up to date";
   updatePushButton();
 
@@ -1036,15 +1049,15 @@ async function loadHistory() {
     subject.textContent = c.message.split("\n")[0] || "(no message)";
     const meta = document.createElement("div");
     meta.className = "gh-commit-meta muted small";
-    meta.append(authorAvatar());
-    // Lore has no per-commit author - show the display name (or identity) if set.
-    const who = repoAuthorName.trim() || repoIdentity.trim();
-    if (who) {
-      const name = document.createElement("span");
-      name.className = "commit-author";
-      name.textContent = who;
-      meta.append(name);
-    }
+    // Show the actual committer of THIS commit (when Lore retained it), not the
+    // local identity - otherwise everyone sees their own name on all commits.
+    const author = (c.author || "").trim();
+    meta.append(authorAvatar(author));
+    const name = document.createElement("span");
+    name.className = "commit-author";
+    name.textContent = authorName(author);
+    name.title = author || "author not recorded by the server";
+    meta.append(name);
     meta.append(document.createTextNode(
       `${c.is_merge ? " merge · " : " "}rev ${c.revision} · ${shortDate(c.date)}`
     ));
@@ -1093,65 +1106,53 @@ function drawMergeLines(box: HTMLElement) {
   if (drew) { box.style.position = "relative"; box.insertBefore(svg, box.firstChild); }
 }
 
-// A consistent avatar for the repo's committer. Lore records no per-commit
-// author, so every commit shows the same repo identity (no more random colour
-// per commit). With an email identity we pull a Gravatar - which serves its own
-// identicon when there is no photo; otherwise a local initials chip.
-function authorAvatar(): HTMLElement {
+// Per-commit avatar: initials + a stable colour derived from THAT commit's
+// author email, with their GitHub/Gravatar photo when the email resolves. An
+// empty email (Lore did not retain the author) shows a neutral "?" chip - we do
+// NOT fall back to the local identity, which would mislabel everyone's commits.
+const avatarByEmail = new Map<string, string>(); // email -> confirmed-loadable url
+function authorAvatar(email: string): HTMLElement {
   const el = document.createElement("span");
   el.className = "avatar";
-  const id = repoIdentity.trim();
-  const gh = repoGithubUser.trim();
-  const label = repoAuthorName.trim() || gh || id;
-  const seed = label || "anonymous";
+  const seed = email || "unknown";
   let hash = 0;
   for (let i = 0; i < seed.length; i++) hash = (hash * 31 + seed.charCodeAt(i)) >>> 0;
   el.style.background = `hsl(${hash % 360} 30% 38%)`;
-  el.textContent = label.replace(/[^a-zA-Z0-9]/g, "").slice(0, 2).toUpperCase() || "?";
-  // A GitHub username is the most reliable photo; else try the email's avatar.
-  if (gh) {
-    applyAvatar(el, `https://github.com/${encodeURIComponent(gh)}.png?size=48`);
-  } else if (id.includes("@")) {
-    if (avatarReadyUrl) applyAvatar(el, avatarReadyUrl);
-    else resolveAvatarUrl(id).then((url) => applyAvatar(el, url)).catch(() => {});
+  el.textContent = (email || "?").replace(/[^a-zA-Z0-9]/g, "").slice(0, 2).toUpperCase() || "?";
+  if (email.includes("@")) {
+    resolveAvatarForEmail(email).then((url) => paintAvatar(el, url)).catch(() => {});
   }
   return el;
 }
-function applyAvatar(el: HTMLElement, url: string) {
-  // Already confirmed loadable: the browser has the bytes, so paint it now with
-  // no probe and no initials flash.
-  if (avatarReadyUrl === url) {
-    el.style.backgroundImage = `url(${url})`;
-    el.style.backgroundSize = "cover";
-    el.textContent = "";
-    return;
-  }
-  const probe = new Image();
-  probe.onload = () => {
-    avatarReadyUrl = url;
-    el.style.backgroundImage = `url(${url})`;
-    el.style.backgroundSize = "cover";
-    el.textContent = "";
-  };
-  probe.src = url; // on error, keep the initials chip
-}
-// Pick the avatar URL for an email, once per repo (cached). Prefer a GitHub
-// account with that public email; fall back to Gravatar (which serves its own
-// identicon when there is no photo).
-async function resolveAvatarUrl(email: string): Promise<string> {
-  if (avatarUrl) return avatarUrl;
+// Resolve one email to an avatar URL (GitHub account by public email, else
+// Gravatar), cached per email so different committers keep distinct pictures.
+async function resolveAvatarForEmail(email: string): Promise<string> {
+  const hit = avatarByEmail.get(email);
+  if (hit) return hit;
+  let url = "";
   try {
     const res = await fetch(`https://api.github.com/search/users?q=${encodeURIComponent(email)}+in:email`, {
       headers: { Accept: "application/vnd.github+json" },
     });
     if (res.ok) {
-      const data = await res.json();
-      const url: string | undefined = data?.items?.[0]?.avatar_url;
-      if (url) { avatarUrl = url + (url.includes("?") ? "&" : "?") + "s=48"; return avatarUrl; }
+      const u: string | undefined = (await res.json())?.items?.[0]?.avatar_url;
+      if (u) url = u + (u.includes("?") ? "&" : "?") + "s=48";
     }
   } catch { /* offline or rate-limited - fall through to Gravatar */ }
-  avatarUrl = await gravatarUrl(email);
-  return avatarUrl;
+  if (!url) url = await gravatarUrl(email);
+  avatarByEmail.set(email, url);
+  return url;
+}
+function paintAvatar(el: HTMLElement, url: string) {
+  const probe = new Image();
+  probe.onload = () => { el.style.backgroundImage = `url(${url})`; el.style.backgroundSize = "cover"; el.textContent = ""; };
+  probe.src = url; // on error keep the initials chip
+}
+// A friendly name for a committer email ("a@b.com" -> "a"), or "unknown".
+function authorName(email: string): string {
+  if (!email) return "unknown";
+  const at = email.indexOf("@");
+  return at > 0 ? email.slice(0, at) : email;
 }
 async function gravatarUrl(email: string): Promise<string> {
   const data = new TextEncoder().encode(email.trim().toLowerCase());
@@ -1976,8 +1977,11 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 // ---- Server control ----
 function setServerState(up: boolean) {
-  const addr = getServerAddr();
-  const local = isLocalAddr(addr);
+  // When a project is open, the meaningful Local/Remote is THAT project's server
+  // (its remote_url), not the settings address - a cloned remote repo must read
+  // "Remote". Fall back to the settings address when no project is open.
+  const addr = repoPath && repoRemoteUrl ? repoRemoteUrl : getServerAddr();
+  const local = repoPath ? !repoIsRemote : isLocalAddr(addr);
   const type = local ? "Local" : "Remote";
 
   const dot = $("server-dot");
@@ -2201,8 +2205,7 @@ async function saveSettings() {
       if (out !== null) { repoIdentity = newId; avatarChanged = true; }
     }
     if (avatarChanged) {
-      avatarUrl = null;
-      avatarReadyUrl = null;
+      avatarByEmail.clear();
       if (!$("pane-history").classList.contains("hidden")) loadHistory();
     }
   }
@@ -2327,6 +2330,7 @@ window.addEventListener("DOMContentLoaded", () => {
   // Bring the server up (auto-start local), then keep the status dot fresh.
   ensureServer();
   setInterval(refreshServerStatus, 6000);
+  startChangeWatcher();
 
   // Re-open last project.
   const last = localStorage.getItem("repoPath");
